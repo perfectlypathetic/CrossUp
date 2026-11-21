@@ -32,6 +32,9 @@ class ApiError(val code: Int, message: String) : Exception(message)
 object GeminiHttp {
     private const val TAG = "GeminiHttp"
 
+    /** Bir istekte en fazla kaç farklı model denenir. */
+    private const val MAX_TRIES = 3
+
     /** model -> bu zamana (ms) kadar kullanma. */
     private val cooldown = ConcurrentHashMap<String, Long>()
     @Volatile var lastModel: String = ""; private set
@@ -50,7 +53,7 @@ object GeminiHttp {
         prompt: String, maxTokens: Int
     ): String = withContext(Dispatchers.IO) {
         var last = "bilinmiyor"
-        for (model in order(chain).take(2)) {      // en fazla 2 model dene (hız için)
+        for (model in order(chain).take(MAX_TRIES)) {
             try {
                 val out = try {
                     call(apiKey, model, image, mime, prompt, maxTokens, plain = model.startsWith("gemma"))
@@ -62,7 +65,7 @@ object GeminiHttp {
                 lastModel = model
                 return@withContext out
             } catch (e: ApiError) {
-                last = "$model: ${e.message}"
+                last = "$model: HTTP ${e.code} ${e.message}"
                 Log.w(TAG, last)
                 if (isKeyError(e) || e.code == 401 || e.code == 403) throw e      // anahtar sorunu: model değiştirmek çare değil
                 when (e.code) {
