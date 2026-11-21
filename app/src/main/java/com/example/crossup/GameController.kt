@@ -1,6 +1,8 @@
 package com.example.crossup.game
 
+import android.content.Context
 import android.graphics.Bitmap
+import com.example.crossup.ai.ClueDb
 import com.example.crossup.ai.GeminiBoardReader
 import com.example.crossup.ai.GeminiClueSolver
 import com.example.crossup.parser.*
@@ -9,6 +11,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -42,10 +45,11 @@ class Analysis(
     val note: String
 )
 
-class GameController(apiKey: String) {
+class GameController(apiKey: String, ctx: Context) {
     private val parser = GridParser()
     private val solver = GeminiClueSolver(apiKey)
     private val reader = GeminiBoardReader(apiKey)
+    private val db = ClueDb(ctx)
     val turns = TurnTracker()
 
     private var signature = ""
@@ -53,6 +57,9 @@ class GameController(apiKey: String) {
     private val candCache = ConcurrentHashMap<WordSlot, List<Candidate>>()
 
     suspend fun analyze(bmp: Bitmap, progress: (String) -> Unit = {}): Analysis {
+        // Yapay zekaya ayrılan toplam süre sınırı (ms). Bu süreden sonra yeni ipucu sorulmaz.
+        val deadline = System.currentTimeMillis() + 30_000
+
         progress("Izgara aranıyor…")
         val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
         progress("Izgara ${board.rows}x${board.cols}, ${board.slots.size} yuva. Harfler okunuyor…")
@@ -64,21 +71,33 @@ class GameController(apiKey: String) {
         val st = GameState(board)
         val filled = board.cellsOf(CellKind.FILLED)
         val need = filled.filter { it !in letterCache }
-        val reading = reader.read(bmp.toJpeg(), board, need)
+        val jpeg = bmp.toJpeg()
+        var reading = reader.read(jpeg, board, need)
+        if (reading.rack.isEmpty()) {
+            progress("Raf okunamadı, tekrar deneniyor…")
+            reading = reader.read(jpeg, board, need)
+        }
         for (p in need) reading.letters[p]?.let { letterCache[p] = it }
         for (p in filled) letterCache[p]?.let { st.known[p] = it }
         if (reading.rack.isEmpty()) error("Raftaki harfler okunamadı")
 
-        // İpucu çözümü: sadece henüz bitmemiş yuvalar, en fazla 4 paralel istek.
+        // ÖĞRENME: tamamen dolmuş yuvaların ipucu görüntüsünü ve cevabını telefona kaydet.
+        for (s in board.slots) {
+            if (s.cells.all { it in st.known }) {
+                db.put(db.key(bmp.crop(s.clueRect)), s.cells.map { st.known[it]!! }.joinToString(""))
+            }
+        }
+
+        // İpucu çözümü: sadece henüz bitmemiş yuvalar, en fazla 8 paralel istek.
         val todo = board.slots.filter { st.emptyIn(it) > 0 }
         val done = AtomicInteger(0)
         progress("Raf: ${reading.rack.joinToString("")} — ipuçları çözülüyor 0/${todo.size}")
-        val sem = Semaphore(4)
+        val sem = Semaphore(8)
         val results = coroutineScope {
             todo.map { s ->
                 async {
                     sem.withPermit {
-                        val c = candsFor(s, st, bmp)
+                        val c = candsFor(s, st, bmp, deadline)
                         progress("İpuçları çözülüyor ${done.incrementAndGet()}/${todo.size}")
                         s to c
                     }
@@ -101,12 +120,26 @@ class GameController(apiKey: String) {
         return Analysis(board, reading.rack, plan, note)
     }
 
-    private suspend fun candsFor(s: WordSlot, st: GameState, bmp: Bitmap): List<Candidate> {
+    private suspend fun candsFor(s: WordSlot, st: GameState, bmp: Bitmap, deadline: Long): List<Candidate> {
         val pattern = s.cells.map { st.known[it] ?: '?' }.joinToString("")
         fun fits(w: String) = w.indices.all { pattern[it] == '?' || pattern[it] == w[it] }
         candCache[s]?.let { c -> if (c.any { fits(it.word) }) return c }
-        return try {
-            solver.solve(bmp.crop(s.clueRect).toPng(), s.length, pattern).also { candCache[s] = it }
-        } catch (e: Exception) { emptyList() }
+
+        val crop = bmp.crop(s.clueRect)
+
+        // 1) Önce telefondaki veritabanına bak (anında).
+        val hit = db.get(db.key(crop), s.length).filter { fits(it) }
+        if (hit.isNotEmpty()) return hit.map { Candidate(it, 1.0) }.also { candCache[s] = it }
+
+        // 2) Yoksa yapay zekaya sor, ama süre bittiyse atla.
+        val left = deadline - System.currentTimeMillis()
+        if (left < 3000) return emptyList()
+        return withTimeoutOrNull(left) {
+            try {
+                solver.solve(crop.toPng(), s.length, pattern).also { candCache[s] = it }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        } ?: emptyList()
     }
 }
