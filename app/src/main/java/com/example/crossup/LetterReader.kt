@@ -34,6 +34,14 @@ class LetterReader(ctx: Context) {
     @Volatile var lastUnresolved: Int = 0
         private set
 
+    /** Son read() çağrısında harfi bulunamayan RAF karosu sayısı (bunlar önemli). */
+    @Volatile var lastUnresolvedRack: Int = 0
+        private set
+
+    /** Son read() çağrısında harfi bulunamayan TAHTA hücresi sayısı (analizi engellemez). */
+    @Volatile var lastUnresolvedBoard: Int = 0
+        private set
+
     private class Item(val rackIdx: Int, val cell: CellPos?, val crop: Bitmap, val fp: Fp) {
         var ch: Char? = null
         var skipped = false
@@ -88,6 +96,8 @@ class LetterReader(ctx: Context) {
         }
 
         lastUnresolved = items.count { it.ch == null }
+        lastUnresolvedRack = items.count { it.rackIdx >= 0 && it.ch == null }
+        lastUnresolvedBoard = items.count { it.rackIdx < 0 && it.ch == null }
 
         val rack = items.filter { it.rackIdx >= 0 && it.ch != null }
             .sortedBy { it.rackIdx }.map { it.ch!! }
