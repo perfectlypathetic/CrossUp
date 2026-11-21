@@ -46,15 +46,24 @@ class Analysis(
 )
 
 class GameController(apiKey: String, ctx: Context) {
+    companion object {
+        /** Bir analizde yapay zekaya en fazla kaç ipucu sorulsun (kota koruması). */
+        const val MAX_AI_PER_ANALYSIS = 12
+        /** Üst üste bu kadar AI hatasında o analizde AI'a sormayı bırak. */
+        const val MAX_AI_FAILS = 2
+    }
+
     private val parser = GridParser()
     private val solver = GeminiClueSolver(apiKey)
     private val reader = GeminiBoardReader(apiKey)
-    private val db = ClueDb(ctx)
+    private val db = ClueDb.get(ctx)
     val turns = TurnTracker()
 
     private var signature = ""
     private val letterCache = HashMap<CellPos, Char>()
     private val candCache = ConcurrentHashMap<WordSlot, List<Candidate>>()
+    /** Bu yuva için AI'a en son hangi desenle soruldu. Aynı desenle tekrar sorulmaz. */
+    private val asked = ConcurrentHashMap<WordSlot, String>()
 
     suspend fun analyze(bmp: Bitmap, progress: (String) -> Unit = {}): Analysis {
         // Yapay zekaya ayrılan toplam süre sınırı (ms). Bu süreden sonra yeni ipucu sorulmaz.
@@ -66,7 +75,9 @@ class GameController(apiKey: String, ctx: Context) {
 
         // Yeni oyun mu? İpucu hücrelerinin düzeni değiştiyse her şeyi sıfırla.
         val sig = board.slots.joinToString("|") { "${it.dir}${it.clueCell.r},${it.clueCell.c}:${it.length}" }
-        if (sig != signature) { signature = sig; letterCache.clear(); candCache.clear(); turns.reset() }
+        if (sig != signature) {
+            signature = sig; letterCache.clear(); candCache.clear(); asked.clear(); turns.reset()
+        }
 
         val st = GameState(board)
         val filled = board.cellsOf(CellKind.FILLED)
@@ -88,16 +99,20 @@ class GameController(apiKey: String, ctx: Context) {
             }
         }
 
-        // İpucu çözümü: sadece henüz bitmemiş yuvalar, en fazla 8 paralel istek.
-        val todo = board.slots.filter { st.emptyIn(it) > 0 }
+        // İpucu çözümü: sadece henüz bitmemiş yuvalar. Harfi çok dolu (bilgisi değerli) yuvalar önce.
+        val todo = board.slots.filter { st.emptyIn(it) > 0 }.sortedBy { st.emptyIn(it) }
         val done = AtomicInteger(0)
+        val dbHits = AtomicInteger(0)
+        val aiCalls = AtomicInteger(0)
+        val aiFails = AtomicInteger(0)
+        val aiBudget = AtomicInteger(MAX_AI_PER_ANALYSIS)
         progress("Raf: ${reading.rack.joinToString("")} — ipuçları çözülüyor 0/${todo.size}")
         val sem = Semaphore(8)
         val results = coroutineScope {
             todo.map { s ->
                 async {
                     sem.withPermit {
-                        val c = candsFor(s, st, bmp, deadline)
+                        val c = candsFor(s, st, bmp, deadline, dbHits, aiCalls, aiFails, aiBudget)
                         progress("İpuçları çözülüyor ${done.incrementAndGet()}/${todo.size}")
                         s to c
                     }
@@ -116,28 +131,50 @@ class GameController(apiKey: String, ctx: Context) {
             append(turns.label)
             if (!turns.endgame && st.inEndgame()) append(" — boş hücre ${st.emptyCells().size}, son 4 turu başlat!")
             if (turns.endgame && !turns.nextIsMine && !turns.finished) append(" (rakibin hamlesini bekle)")
+            append("\nDB:${dbHits.get()} AI:${aiCalls.get()} (kayıtlı: ${db.size()})")
         }
         return Analysis(board, reading.rack, plan, note)
     }
 
-    private suspend fun candsFor(s: WordSlot, st: GameState, bmp: Bitmap, deadline: Long): List<Candidate> {
+    /**
+     * Sıra: 1) bellek  2) telefondaki veritabanı  3) yapay zeka (SON ÇARE).
+     */
+    private suspend fun candsFor(
+        s: WordSlot, st: GameState, bmp: Bitmap, deadline: Long,
+        dbHits: AtomicInteger, aiCalls: AtomicInteger, aiFails: AtomicInteger, aiBudget: AtomicInteger
+    ): List<Candidate> {
         val pattern = s.cells.map { st.known[it] ?: '?' }.joinToString("")
         fun fits(w: String) = w.indices.all { pattern[it] == '?' || pattern[it] == w[it] }
+
+        // 1) Bellek
         candCache[s]?.let { c -> if (c.any { fits(it.word) }) return c }
 
         val crop = bmp.crop(s.clueRect)
 
-        // 1) Önce telefondaki veritabanına bak (anında).
+        // 2) Telefondaki veritabanı (anında, kotasız)
         val hit = db.get(db.key(crop), s.length).filter { fits(it) }
-        if (hit.isNotEmpty()) return hit.map { Candidate(it, 1.0) }.also { candCache[s] = it }
+        if (hit.isNotEmpty()) {
+            dbHits.incrementAndGet()
+            return hit.map { Candidate(it, 1.0) }.also { candCache[s] = it }
+        }
 
-        // 2) Yoksa yapay zekaya sor, ama süre bittiyse atla.
+        // 3) Yapay zeka: sadece gerçekten gerekiyorsa
+        if (asked[s] == pattern) return emptyList()          // aynı soruyu zaten sorduk, yeni bilgi yok
+        if (aiFails.get() >= MAX_AI_FAILS) return emptyList() // kota/ağ sorunu: israf etme
         val left = deadline - System.currentTimeMillis()
         if (left < 3000) return emptyList()
+        if (aiBudget.decrementAndGet() < 0) return emptyList() // bu analizin AI hakkı doldu, sonraki analizde sorulur
+
         return withTimeoutOrNull(left) {
             try {
-                solver.solve(crop.toPng(), s.length, pattern).also { candCache[s] = it }
+                aiCalls.incrementAndGet()
+                solver.solve(crop.toPng(), s.length, pattern).also {
+                    candCache[s] = it
+                    asked[s] = pattern
+                    aiFails.set(0)
+                }
             } catch (e: Exception) {
+                aiFails.incrementAndGet()
                 emptyList()
             }
         } ?: emptyList()
