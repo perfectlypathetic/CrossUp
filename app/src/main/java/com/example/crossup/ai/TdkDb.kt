@@ -3,6 +3,8 @@ package com.example.crossup.ai
 import android.content.Context
 import android.util.Log
 import com.example.crossup.game.TR
+import java.io.IOException
+import java.io.InputStream
 import kotlin.math.ln
 
 /** Bir sözlük kelimesi ve tanımına göre aldığı puan. */
@@ -94,6 +96,22 @@ class TdkDb private constructor(private val ctx: Context) {
         }
     }
 
+    /**
+     * tdk.txt'yi açar. Bulunamazsa adı "tdk" ile başlayan başka bir dosyayı dener.
+     * Hiçbiri yoksa assets içinde ne olduğunu hata mesajına yazar.
+     */
+    private fun openAsset(): InputStream {
+        try {
+            return ctx.assets.open(ASSET)
+        } catch (e: IOException) {
+            val names = try { ctx.assets.list("")?.toList() ?: emptyList() } catch (x: Exception) { emptyList() }
+            val alt = names.firstOrNull { it.startsWith("tdk", ignoreCase = true) }
+            if (alt != null) return ctx.assets.open(alt)
+            val found = if (names.isEmpty()) "assets klasörü boş/yok" else names.take(8).joinToString(",")
+            throw IOException("assets'te tdk.txt yok. Bulunanlar: $found")
+        }
+    }
+
     /** Sözlüğü yükler (ilk çağrıda). Dosya okuduğu için arka plan iş parçacığında çağır. */
     @Synchronized
     fun ensureLoaded(): Boolean {
@@ -104,14 +122,14 @@ class TdkDb private constructor(private val ctx: Context) {
             val dfList = ArrayList<Int>()
             var n = 0
 
-            ctx.assets.open(ASSET).bufferedReader(Charsets.UTF_8).useLines { lines ->
+            openAsset().bufferedReader(Charsets.UTF_8).useLines { lines ->
                 for (line in lines) {
                     if (line.isEmpty() || line[0] == '#') continue
                     val tab = line.indexOf('\t')
                     if (tab <= 0) continue
                     val word = line.substring(0, tab)
                     if (word.length !in 1..MAX_LEN) continue
-                    val parts = line.substring(tab + 1).split(' ')
+                    val parts = line.substring(tab + 1).trim().split(' ')
                     val tmp = IntArray(parts.size)
                     var k = 0
                     for (p in parts) {
@@ -131,6 +149,8 @@ class TdkDb private constructor(private val ctx: Context) {
                 }
             }
 
+            if (n == 0) throw IOException("tdk.txt okundu ama içinde kelime yok")
+
             val total = n.toDouble()
             idf = DoubleArray(dfList.size) { ln(1.0 + total / dfList[it]) }
             buckets = bk
@@ -140,7 +160,7 @@ class TdkDb private constructor(private val ctx: Context) {
             lastError = ""
             Log.i(TAG, "TDK yüklendi: $n kelime, ${dfList.size} kök")
             return true
-        } catch (e: Exception) {
+        } catch (e: Throwable) {   // OutOfMemoryError dahil
             lastError = (e.message ?: e.javaClass.simpleName).take(120)
             Log.w(TAG, "TDK yüklenemedi: $lastError")
             return false
