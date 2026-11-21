@@ -2,170 +2,188 @@ package com.example.crossup.ai
 
 import android.content.Context
 import android.graphics.Bitmap
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.File
+import com.example.crossup.game.TR
+import com.example.crossup.parser.CellPos
+import com.example.crossup.parser.ParsedBoard
+import com.example.crossup.parser.Rect
+import com.example.crossup.parser.crop
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 import kotlin.math.abs
 
-/** Harf görüntüsünün parmak izi: 16x16 mürekkep maskesi + en/boy oranı. */
-class Fp(val bits: String, val aspect: Float)
+/** Bilinmeyen harf için kullanıcıya sorar. (kırpılmış görüntü, tahmin, kalan bilinmeyen sayısı) -> harf veya null (atla). */
+typealias AskLetter = suspend (Bitmap, Char?, Int) -> Char?
 
-object LetterFp {
-    private const val N = 16
-
-    /** Kırpılmış harf görüntüsünden parmak izi çıkarır. Harf yoksa null. */
-    fun of(bmp: Bitmap): Fp? {
-        val w = bmp.width; val h = bmp.height
-        if (w < 8 || h < 8) return null
-        val px = IntArray(w * h)
-        bmp.getPixels(px, 0, w, 0, 0, w, h)
-        val lum = IntArray(w * h)
-        var mn = 255; var sum = 0L
-        for (i in px.indices) {
-            val p = px[i]
-            val l = (((p shr 16) and 0xFF) * 30 + ((p shr 8) and 0xFF) * 59 + (p and 0xFF) * 11) / 100
-            lum[i] = l
-            if (l < mn) mn = l
-            sum += l
-        }
-        val mean = sum.toDouble() / px.size
-        if (mean - mn < 60) return null                 // kontrast yok: harf yok
-        val thr = mn + (mean - mn) * 0.5                // koyu mürekkep eşiği
-
-        var x0 = w; var y0 = h; var x1 = -1; var y1 = -1; var cnt = 0
-        for (y in 0 until h) for (x in 0 until w) {
-            if (lum[y * w + x] < thr) {
-                cnt++
-                if (x < x0) x0 = x
-                if (x > x1) x1 = x
-                if (y < y0) y0 = y
-                if (y > y1) y1 = y
-            }
-        }
-        if (cnt < 30 || x1 - x0 < 5 || y1 - y0 < 6) return null
-
-        val bw = x1 - x0 + 1; val bh = y1 - y0 + 1
-        val sb = StringBuilder(N * N)
-        for (j in 0 until N) for (i in 0 until N) {
-            val sx0 = x0 + i * bw / N
-            val sx1 = maxOf(sx0 + 1, x0 + (i + 1) * bw / N)
-            val sy0 = y0 + j * bh / N
-            val sy1 = maxOf(sy0 + 1, y0 + (j + 1) * bh / N)
-            var on = 0; var tot = 0
-            for (y in sy0 until sy1) for (x in sx0 until sx1) {
-                tot++
-                if (lum[y * w + x] < thr) on++
-            }
-            sb.append(if (on * 2 > tot) '1' else '0')
-        }
-        return Fp(sb.toString(), bw.toFloat() / bh)
-    }
-}
+const val TR_ALPHABET = "ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZ"
 
 /**
- * Harf şablonları: parmak izi -> harf. Telefonda kalıcı saklanır.
- * Aynı harf için birden fazla şablon tutulabilir (raf ve tahta boyutları farklı olabilir).
+ * Yapay zekasız harf okuyucu.
+ * Sıra: 1) şablon eşleştirme  2) ML Kit tahmini (sadece öneri)  3) kullanıcıya sor.
+ * Sadece kullanıcının onayladığı harfler şablon olarak kaydedilir.
  */
-class LetterDb private constructor(ctx: Context) {
-    private class T(val fp: Fp, val ch: Char)
+class LetterReader(ctx: Context) {
+    private val db = LetterDb.get(ctx)
+    private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
 
-    private val file = File(ctx.filesDir, "letters.json")
-    private val tmp = File(ctx.filesDir, "letters.json.tmp")
-    private val list = ArrayList<T>()
+    /** Son read() çağrısında harfi bulunamayan karo sayısı (raf + tahta). */
+    @Volatile var lastUnresolved: Int = 0
+        private set
 
-    companion object {
-        /** Bu farktan (256 bit + en/boy cezası) büyükse eşleşme sayılmaz. */
-        const val MAX_DIST = 28
-        /** En iyi harf ile ikinci en iyi FARKLI harf arasında en az bu fark olmalı. */
-        const val MARGIN = 8
+    /** Son read() çağrısında harfi bulunamayan RAF karosu sayısı (bunlar önemli). */
+    @Volatile var lastUnresolvedRack: Int = 0
+        private set
 
-        @Volatile private var inst: LetterDb? = null
-        fun get(ctx: Context): LetterDb =
-            inst ?: synchronized(this) {
-                inst ?: LetterDb(ctx.applicationContext).also { inst = it }
-            }
+    /** Son read() çağrısında harfi bulunamayan TAHTA hücresi sayısı (analizi engellemez). */
+    @Volatile var lastUnresolvedBoard: Int = 0
+        private set
 
-        fun dist(a: Fp, b: Fp): Int {
-            var d = 0
-            val n = minOf(a.bits.length, b.bits.length)
-            for (i in 0 until n) if (a.bits[i] != b.bits[i]) d++
-            return d + (abs(a.aspect - b.aspect) * 40f).toInt()
-        }
+    private class Item(val rackIdx: Int, val cell: CellPos?, val crop: Bitmap, val fp: Fp) {
+        var ch: Char? = null
+        var skipped = false
     }
 
-    init {
-        runCatching {
-            if (file.exists()) {
-                val a = JSONArray(file.readText())
-                for (i in 0 until a.length()) {
-                    val o = a.getJSONObject(i)
-                    list.add(T(Fp(o.getString("b"), o.getDouble("a").toFloat()), o.getString("c")[0]))
-                }
+    suspend fun read(
+        bmp: Bitmap, board: ParsedBoard, need: List<CellPos>,
+        ask: AskLetter?, includeRack: Boolean
+    ): Reading {
+        val items = ArrayList<Item>()
+
+        if (includeRack) {
+            val tiles = locateRack(bmp, board)
+            tiles.forEachIndexed { i, r ->
+                val crop = inner(bmp, r, 0.075)
+                val fp = LetterFp.of(crop)
+                if (fp != null) items.add(Item(i, null, crop, fp))
             }
         }
-    }
-
-    /** Eşleşen harfi döner; emin değilse null. */
-    @Synchronized
-    fun match(fp: Fp): Char? {
-        if (list.isEmpty()) return null
-        val per = HashMap<Char, Int>()
-        for (t in list) {
-            val d = dist(fp, t.fp)
-            val old = per[t.ch]
-            if (old == null || d < old) per[t.ch] = d
+        for (p in need) {
+            val crop = inner(bmp, board.cellRects[p.r][p.c], 0.125)
+            val fp = LetterFp.of(crop)
+            if (fp != null) items.add(Item(-1, p, crop, fp))
         }
-        val sorted = per.entries.sortedBy { it.value }
-        val best = sorted[0]
-        val second = sorted.getOrNull(1)?.value ?: Int.MAX_VALUE
-        return if (best.value <= MAX_DIST && second - best.value >= MARGIN) best.key else null
-    }
 
-    /** Doğrulanmış harfi şablon olarak kaydeder (çok benzer şablon varsa eklemez). */
-    @Synchronized
-    fun learn(fp: Fp, ch: Char) {
-        if (add(fp, ch)) save()
-    }
+        // 1) şablon eşleştirme
+        for (item in items) item.ch = db.match(item.fp)
 
-    private fun add(fp: Fp, ch: Char): Boolean {
-        if (list.any { it.ch == ch && dist(it.fp, fp) <= 4 }) return false
-        list.add(T(fp, ch))
-        return true
-    }
+        // 2-3) eşleşmeyenler için tahmin + soru
+        val skippedFps = ArrayList<Fp>()
+        while (true) {
+            val next = items.firstOrNull { it.ch == null && !it.skipped } ?: break
 
-    @Synchronized
-    fun size(): Int = list.size
+            val again = db.match(next.fp)          // önceki cevaplar yüzünden artık eşleşebilir
+            if (again != null) { next.ch = again; continue }
 
-    /** Bulut eşitleme için tüm şablonları JSON olarak verir. */
-    @Synchronized
-    fun snapshot(): JSONArray = toJsonArray()
+            if (skippedFps.any { LetterDb.dist(it, next.fp) <= 20 } || ask == null) {
+                next.skipped = true
+                continue
+            }
 
-    /** JSON'daki şablonları birleştirerek ekler. Yeni eklenen şablon sayısını döner. */
-    @Synchronized
-    fun mergeJson(a: JSONArray): Int {
-        var added = 0
-        for (i in 0 until a.length()) {
-            runCatching {
-                val o = a.getJSONObject(i)
-                val fp = Fp(o.getString("b"), o.getDouble("a").toFloat())
-                if (add(fp, o.getString("c")[0])) added++
+            val remaining = items.count { it.ch == null && !it.skipped }
+            val guess = guess(next.crop)
+            val answer = ask(next.crop, guess, remaining)
+            if (answer == null) {
+                skippedFps.add(next.fp)
+                next.skipped = true
+            } else {
+                db.learn(next.fp, answer)
+                next.ch = answer
             }
         }
-        if (added > 0) save()
-        return added
-    }
 
-    private fun toJsonArray(): JSONArray {
-        val a = JSONArray()
-        for (t in list) a.put(JSONObject().put("b", t.fp.bits).put("a", t.fp.aspect.toDouble()).put("c", t.ch.toString()))
-        return a
-    }
+        lastUnresolved = items.count { it.ch == null }
+        lastUnresolvedRack = items.count { it.rackIdx >= 0 && it.ch == null }
+        lastUnresolvedBoard = items.count { it.rackIdx < 0 && it.ch == null }
 
-    private fun save() {
-        runCatching {
-            val json = toJsonArray().toString()
-            tmp.writeText(json)
-            if (!tmp.renameTo(file)) file.writeText(json)
+        val rack = items.filter { it.rackIdx >= 0 && it.ch != null }
+            .sortedBy { it.rackIdx }.map { it.ch!! }
+        val letters = HashMap<CellPos, Char>()
+        for (item in items) {
+            val c = item.cell; val ch = item.ch
+            if (c != null && ch != null) letters[c] = ch
         }
+        return Reading(rack, letters)
+    }
+
+    private fun inner(bmp: Bitmap, r: Rect, frac: Double): Bitmap {
+        val dx = ((r.x1 - r.x0) * frac).toInt()
+        val dy = ((r.y1 - r.y0) * frac).toInt()
+        return bmp.crop(Rect(r.x0 + dx, r.y0 + dy, r.x1 - dx, r.y1 - dy))
+    }
+
+    /** ML Kit ile tek harf tahmini (sadece öneri). */
+    private suspend fun guess(crop: Bitmap): Char? = try {
+        val big = Bitmap.createScaledBitmap(crop, crop.width * 2, crop.height * 2, true)
+        val text = suspendCancellableCoroutine<String> { cont ->
+            recognizer.process(InputImage.fromBitmap(big, 0))
+                .addOnSuccessListener { t -> if (cont.isActive) cont.resume(t.text) }
+                .addOnFailureListener { if (cont.isActive) cont.resume("") }
+        }
+        text.trim().uppercase(TR).firstOrNull { it in TR_ALPHABET }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        null
+    }
+
+    // ---------- raf konumu ----------
+
+    private fun differs(p: Int, bg: Int): Boolean =
+        abs(((p shr 16) and 0xFF) - ((bg shr 16) and 0xFF)) +
+        abs(((p shr 8) and 0xFF) - ((bg shr 8) and 0xFF)) +
+        abs((p and 0xFF) - (bg and 0xFF)) > 30
+
+    /** Tahtanın altındaki raf karolarını bulur (soldan sağa). */
+    private fun locateRack(bmp: Bitmap, board: ParsedBoard): List<Rect> {
+        val first = board.cellRects[0][0]
+        val cw = first.x1 - first.x0
+        val bottom = board.cellRects.last()[0].y1
+        val w = bmp.width; val h = bmp.height
+        val yStart = bottom + 6
+        val yEnd = minOf(h - 1, bottom + (cw * 1.6).toInt())
+        if (yStart >= yEnd) return emptyList()
+
+        // Karoların dikey aralığı: arka plandan farklı piksel oranı yüksek satırlar.
+        var top = -1; var bot = -1
+        for (y in yStart..yEnd) {
+            val bg = bmp.getPixel(3, y)
+            var n = 0; var d = 0
+            var x = 0
+            while (x < w) {
+                n++
+                if (differs(bmp.getPixel(x, y), bg)) d++
+                x += 4
+            }
+            if (d.toDouble() / n > 0.06) {
+                if (top < 0) top = y
+                bot = y
+            } else if (top >= 0 && y - bot > 12) break
+        }
+        if (top < 0 || bot - top < cw / 2) return emptyList()
+
+        // Karoların yatay aralıkları: karonun alt kısmından geçen çizgide arka plandan farklı bölgeler.
+        val ly = top + ((bot - top) * 0.88).toInt()
+        val bg = bmp.getPixel(3, ly)
+        val runs = ArrayList<Rect>()
+        var start = -1; var lastD = -100
+        fun close() {
+            if (start >= 0) {
+                val len = lastD - start + 1
+                if (len >= cw * 0.6 && len <= cw * 1.4) runs.add(Rect(start, top, lastD + 1, bot + 1))
+                start = -1
+            }
+        }
+        for (x in 0 until w) {
+            if (differs(bmp.getPixel(x, ly), bg)) {
+                if (start < 0) start = x
+                lastD = x
+            } else if (start >= 0 && x - lastD > 4) close()
+        }
+        close()
+        return runs
     }
 }
