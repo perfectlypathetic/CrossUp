@@ -13,7 +13,11 @@ class Fp(val bits: String, val aspect: Float)
 object LetterFp {
     private const val N = 16
 
-    /** Kırpılmış harf görüntüsünden parmak izi çıkarır. Harf yoksa null. */
+    /**
+     * Kırpılmış harf görüntüsünden parmak izi çıkarır. Harf yoksa null.
+     * Kırpmanın kenarına değen koyu parçalar (ok üçgeni, hücre çizgisi, komşu hücre) silinir;
+     * küçük lekeler harf sayılmaz.
+     */
     fun of(bmp: Bitmap): Fp? {
         val w = bmp.width; val h = bmp.height
         if (w < 8 || h < 8) return null
@@ -32,9 +36,29 @@ object LetterFp {
         if (mean - mn < 60) return null                 // kontrast yok: harf yok
         val thr = mn + (mean - mn) * 0.5                // koyu mürekkep eşiği
 
+        // Mürekkep maskesi.
+        val ink = BooleanArray(w * h) { lum[it] < thr }
+
+        // Kenara değen mürekkep parçalarını sil (kenardan başlayıp yayılarak).
+        val stack = IntArray(w * h)
+        var sp = 0
+        fun seed(i: Int) {
+            if (ink[i]) { ink[i] = false; stack[sp++] = i }
+        }
+        for (x in 0 until w) { seed(x); seed((h - 1) * w + x) }
+        for (y in 0 until h) { seed(y * w); seed(y * w + w - 1) }
+        while (sp > 0) {
+            val i = stack[--sp]
+            val x = i % w; val y = i / w
+            if (x > 0) seed(i - 1)
+            if (x < w - 1) seed(i + 1)
+            if (y > 0) seed(i - w)
+            if (y < h - 1) seed(i + w)
+        }
+
         var x0 = w; var y0 = h; var x1 = -1; var y1 = -1; var cnt = 0
         for (y in 0 until h) for (x in 0 until w) {
-            if (lum[y * w + x] < thr) {
+            if (ink[y * w + x]) {
                 cnt++
                 if (x < x0) x0 = x
                 if (x > x1) x1 = x
@@ -43,6 +67,7 @@ object LetterFp {
             }
         }
         if (cnt < 30 || x1 - x0 < 5 || y1 - y0 < 6) return null
+        if ((y1 - y0 + 1) < h * 0.3) return null        // harf kırpmanın en az %30'u kadar uzun olmalı
 
         val bw = x1 - x0 + 1; val bh = y1 - y0 + 1
         val sb = StringBuilder(N * N)
@@ -54,7 +79,7 @@ object LetterFp {
             var on = 0; var tot = 0
             for (y in sy0 until sy1) for (x in sx0 until sx1) {
                 tot++
-                if (lum[y * w + x] < thr) on++
+                if (ink[y * w + x]) on++
             }
             sb.append(if (on * 2 > tot) '1' else '0')
         }
