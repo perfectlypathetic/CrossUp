@@ -64,7 +64,8 @@ class LetterResult(
     val boardFilled: Int,    // tahtadaki dolu hücre sayısı
     val boardKnown: Int,     // bunlardan harfi bilinenler
     val unresolved: Int,     // tanınamayan karo sayısı (raf + tahta)
-    val rackMissing: Int     // tanınamayan RAF karosu sayısı
+    val rackMissing: Int,    // tanınamayan RAF karosu sayısı
+    val info: String = ""    // raf arama teşhisi
 )
 
 class GameController(apiKey: String, ctx: Context) {
@@ -139,7 +140,8 @@ class GameController(apiKey: String, ctx: Context) {
             boardFilled = filled.size,
             boardKnown = filled.count { it in letterCache },
             unresolved = letters.lastUnresolved,
-            rackMissing = letters.lastUnresolvedRack
+            rackMissing = letters.lastUnresolvedRack,
+            info = letters.lastRackInfo
         )
     }
 
@@ -200,9 +202,9 @@ class GameController(apiKey: String, ctx: Context) {
         for (p in filled) letterCache[p]?.let { st.known[p] = it }
 
         if (letters.lastUnresolvedRack > 0)
-            error("Raftaki ${letters.lastUnresolvedRack} harf tanınamadı. 'Harfleri tanı' butonuna bas, sonra Analiz.")
+            error("Raftaki ${letters.lastUnresolvedRack} harf tanınamadı. 'Harfleri tanı' butonuna bas, sonra Analiz.\n[${letters.lastRackInfo}]")
         if (reading.rack.isEmpty())
-            error("Raftaki harfler okunamadı. 'Harfleri tanı' butonuna bas, sonra Analiz.")
+            error("Raftaki harfler okunamadı. 'Harfleri tanı' butonuna bas, sonra Analiz.\n[${letters.lastRackInfo}]")
 
         val deadline = System.currentTimeMillis() + AI_TIME_LIMIT_MS
 
