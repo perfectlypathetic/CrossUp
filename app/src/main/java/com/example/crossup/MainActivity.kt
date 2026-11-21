@@ -11,6 +11,7 @@ import android.widget.*
 import com.example.crossup.ai.ClueDb
 import com.example.crossup.ai.CloudSync
 import com.example.crossup.ai.LetterDb
+import com.example.crossup.ai.TdkDb
 import com.example.crossup.service.CaptureService
 
 class MainActivity : Activity() {
@@ -111,6 +112,16 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         refreshInfo()
+
+        // TDK sözlüğünü arka planda yükle (yüklüyse hemen biter).
+        val tdkDb = TdkDb.get(this)
+        if (!tdkDb.isLoaded) {
+            Thread {
+                tdkDb.ensureLoaded()
+                runOnUiThread { refreshInfo() }
+            }.start()
+        }
+
         // Bulut bağlıysa arka planda eşitle.
         if (CloudSync.uri(this) != null) {
             Thread {
@@ -123,8 +134,15 @@ class MainActivity : Activity() {
     private fun refreshInfo() {
         val cloud = if (CloudSync.uri(this) == null) "Bulut: bağlı değil"
         else "Bulut: bağlı\n" + CloudSync.lastMessage(this)
+        val tdkDb = TdkDb.get(this)
+        val tdkLine = when {
+            tdkDb.isLoaded -> "TDK: yüklendi (${tdkDb.wordCount} madde)"
+            tdkDb.lastError.isNotEmpty() -> "TDK: yüklenemedi (${tdkDb.lastError})"
+            else -> "TDK: yükleniyor…"
+        }
         info.text = "Kayıtlı kelime: ${ClueDb.get(this).size()}\n" +
             "Kayıtlı harf şablonu: ${LetterDb.get(this).size()}\n" +
+            tdkLine + "\n" +
             cloud + "\n" +
             "API anahtarı buluta kaydedilmez, yeni cihazda elle yapıştır."
     }
@@ -141,39 +159,3 @@ class MainActivity : Activity() {
             }
             REQ_CLOUD_NEW, REQ_CLOUD_PICK -> {
                 val uri = data.data ?: return
-                CloudSync.setUri(this, uri, data.flags)
-                Toast.makeText(this, "Eşitleniyor…", Toast.LENGTH_SHORT).show()
-                Thread {
-                    val msg = CloudSync.sync(applicationContext)
-                    runOnUiThread {
-                        Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
-                        refreshInfo()
-                    }
-                }.start()
-            }
-            REQ_EXPORT -> {
-                val uri = data.data ?: return
-                Thread {
-                    val msg = try {
-                        contentResolver.openOutputStream(uri, "wt")!!.use { CloudSync.exportTo(this@MainActivity, it) }
-                        "Yedek kaydedildi."
-                    } catch (e: Exception) { "Hata: ${e.message}" }
-                    runOnUiThread { Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show() }
-                }.start()
-            }
-            REQ_IMPORT -> {
-                val uri = data.data ?: return
-                Thread {
-                    val msg = try {
-                        val added = contentResolver.openInputStream(uri)!!.use { CloudSync.importFrom(this@MainActivity, it) }
-                        "$added yeni kayıt eklendi."
-                    } catch (e: Exception) { "Okunamadı: ${e.message}" }
-                    runOnUiThread {
-                        Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
-                        refreshInfo()
-                    }
-                }.start()
-            }
-        }
-    }
-}
