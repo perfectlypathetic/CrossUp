@@ -6,17 +6,12 @@ import kotlin.math.roundToInt
 /*
  * Cross-Up ızgara okuyucu (saf Kotlin, Android'e bağımlı değil).
  *
- * Gerçek bir ekran görüntüsü üzerinde Python'da doğrulanan algoritmanın Kotlin karşılığı:
- *  1. Izgara sınırları: üst satır (tamamı yeşil ipucu satırı) ve sol sütun üzerinden bulunur.
- *  2. Hücre türü: hücre kenarındaki 10 px'lik halkanın rengine göre
- *       yeşil -> CLUE, beyaz -> EMPTY, diğer -> FILLED (harf konmuş; harfi okumak ayrı adım).
- *  2b. DÜZELTME: kenara kadar taşan resimli ipucu hücreleri (ör. manzara resmi) yeşil halka vermez
- *       ve FILLED sanılırdı. Hem ok işareti hem de "resim gibi karışık renkli halka" varsa CLUE yapılır.
- *  3. Ok algılama: siyah üçgenler ipucu hücresinin hemen dışında, komşu hücrenin kenarında durur.
- *       sağ ok -> ACROSS, alt ok -> DOWN.
- *  4. Bölünmüş (iki ipucu üst üste) hücre: sağ okun dikey konumu üst yarıdaysa
- *       yatay ipucu üst yarı, dikey ipucu alt yarıdır.
- *  5. Her ok için komşu hücrelerden bir sonraki ipucu hücresine / kenara kadar yürünür -> kelime yuvası.
+ *  1. Izgara sınırları: ipucu yeşili olan her yerin en sol / en alt noktasından bulunur.
+ *     SAĞ kenar: köşede resimli ipucu varsa yeşil görünmez; bu yüzden ızgara ekranda
+ *     ortalı kabul edilir (sağ kenar = ekran genişliği - sol kenar).
+ *  2. Hücre türü: kenar halkasının rengine göre yeşil -> CLUE, beyaz -> EMPTY, diğer -> FILLED.
+ *  2b. Resimli ipucu hücreleri (ok + karışık renkli halka) CLUE yapılır.
+ *  3. Ok algılama, bölünmüş hücreler ve kelime yuvaları önceki sürümle aynı.
  */
 
 interface PixelSource {
@@ -68,37 +63,49 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
 
     /** Izgara bulunamazsa null döner (ör. oyun ekranı açık değil). */
     fun parse(src: PixelSource): ParsedBoard? {
-        // 1) Üst satır: genişliğin yarısından fazlası yeşil olan ilk satır.
+        // 1) Üst satır: genişliğin en az %30'u yeşil olan ilk satır (köşede resim olsa da bulunur).
         var top = -1
         for (y in 0 until src.height) {
             var g = 0
             var x = 0
             while (x < src.width) { if (isGreen(src.rgb(x, y))) g++; x += 3 }
-            if (g * 3 > src.width / 2) { top = y; break }
+            if (g * 10 > src.width) { top = y; break }
         }
         if (top < 0) return null
 
-        var left = Int.MAX_VALUE
-        var right = -1
-        for (x in 0 until src.width) if (isGreen(src.rgb(x, top))) {
-            if (x < left) left = x
-            if (x > right) right = x
+        // 2) Sol/sağ/alt sınır: üstten aşağı, yeşil görülen her yeri tara; uzun bir boşlukta dur.
+        var minX = Int.MAX_VALUE
+        var maxX = -1
+        var lastGreen = top
+        val gap = (src.width * 0.15).toInt()
+        var yy = top
+        while (yy < src.height) {
+            var any = false
+            var x = 0
+            while (x < src.width) {
+                if (isGreen(src.rgb(x, yy))) {
+                    any = true
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                }
+                x += 2
+            }
+            if (any) lastGreen = yy else if (yy - lastGreen > gap) break
+            yy += 2
         }
-        right += 1
+        if (maxX < 0) return null
+
+        val left = minX
+        val expectedRight = src.width - left          // ızgara ekranda ortalı
+        var right = maxX + 1
+        if (right < expectedRight - 8) right = expectedRight   // sağ köşe resimliydi, yeşil görünmedi
         val cw = (right - left) / cfg.cols.toDouble()
         if (cw < 20) return null
 
-        // 2) Alt sınır: sol sütunda yeşil bandı, uzun bir boşluğa kadar izle.
-        var lastGreen = top
-        for (y in top until src.height) {
-            var any = false
-            for (x in left + 8..left + 20) if (isGreen(src.rgb(x, y))) { any = true; break }
-            if (any) lastGreen = y else if (y - lastGreen > cw * 0.5) break
-        }
-        val bottom = lastGreen + 1
+        val bottom = lastGreen + 2
         val rows = ((bottom - top) / cw).roundToInt()
         if (rows < 2) return null
-        val ch = (bottom - top) / rows.toDouble()
+        val ch = cw                                    // hücreler kare
 
         fun rect(r: Int, c: Int) = Rect(
             (left + c * cw).roundToInt(), (top + r * ch).roundToInt(),
@@ -182,9 +189,7 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
         }
     }
 
-    /**
-     * Hücrenin kenar halkasındaki renkler çok mu dağınık? (resim: evet, düz renkli harf karosu: hayır)
-     */
+    /** Hücrenin kenar halkasındaki renkler çok mu dağınık? (resim: evet, düz renkli harf karosu: hayır) */
     private fun ringIsBusy(src: PixelSource, rc: Rect): Boolean {
         val px = ArrayList<Int>()
         fun sample(x0: Int, y0: Int, x1: Int, y1: Int) {
