@@ -121,6 +121,14 @@ class LetterDb private constructor(ctx: Context) {
         return if (best.value <= MAX_DIST && second - best.value >= MARGIN) best.key else null
     }
 
+    /** Verilen alfabenin TÜM harfleri için en az bir şablon kayıtlı mı? */
+    @Synchronized
+    fun hasAll(alphabet: String): Boolean {
+        val have = HashSet<Char>()
+        for (t in list) have.add(t.ch)
+        return alphabet.all { it in have }
+    }
+
     /** Doğrulanmış harfi şablon olarak kaydeder (çok benzer şablon varsa eklemez). */
     @Synchronized
     fun learn(fp: Fp, ch: Char) {
