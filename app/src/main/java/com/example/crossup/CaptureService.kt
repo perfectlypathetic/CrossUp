@@ -117,18 +117,22 @@ class CaptureService : Service() {
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT).apply { gravity = Gravity.TOP or Gravity.START })
 
-        status = TextView(this).apply { setTextColor(Color.WHITE); textSize = 13f; text = "Hazır. Analiz'e bas." }
+        status = TextView(this).apply {
+            setTextColor(Color.WHITE); textSize = 13f
+            text = "Hazır. Önce 'Harfleri tanı', sonra 'Analiz'."
+        }
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(btn("Analiz") { analyze() })
             addView(btn("Son4: ben") { controller.turns.start(true); status.text = controller.turns.label })
             addView(btn("Son4: rakip") { controller.turns.start(false); status.text = controller.turns.label })
-            addView(btn("Sıradaki ▶") { controller.turns.advance(); status.text = controller.turns.label })
+            addView(btn("Sıradaki ▶") { nextTurn() })
             addView(btn("✕") { stopSelf() })
         }
-        // İkinci satır: sadece veritabanını güçlendirir, analiz/plan yapmaz.
+        // İkinci satır: harf tanıma ve veritabanı. Analiz/plan yapmaz, AI kullanmaz.
         val row2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            addView(btn("Harfleri tanı") { recognize() })
             addView(btn("Öğren (kaydet)") { learn() })
         }
 
@@ -165,6 +169,20 @@ class CaptureService : Service() {
             addView(handle); addView(status); addView(row); addView(row2)
         }
         wm.addView(panel, panelLp)
+    }
+
+    /** "Sıradaki ▶": son 4 turda sırayı bir adım ilerletir. */
+    private fun nextTurn() {
+        if (!controller.turns.endgame) {
+            status.text = "Son 4 tur henüz başlamadı. Boş hücre 12'nin altına inince 'Son4: ben' veya " +
+                "'Son4: rakip' tuşuna bas. Bu tuş her hamleden sonra sırayı ilerletir."
+            return
+        }
+        if (!controller.turns.advance()) {
+            status.text = "Oyun bitti (4 tur tamamlandı)."
+            return
+        }
+        status.text = controller.turns.label
     }
 
     // ---------- "Bu harf hangisi?" penceresi ----------
@@ -232,7 +250,7 @@ class CaptureService : Service() {
                 val bmp = capture()
                 val a = withTimeoutOrNull(300_000) {
                     withContext(Dispatchers.Default) {
-                        controller.analyze(bmp, { c, g, n -> askLetter(c, g, n) }) { msg ->
+                        controller.analyze(bmp) { msg ->
                             status.post { status.text = msg }
                         }
                     }
@@ -242,6 +260,35 @@ class CaptureService : Service() {
                 throw e
             } catch (e: Throwable) {
                 android.util.Log.e("CrossUp", "analyze", e)
+                status.text = "Hata: ${e.message ?: e.javaClass.simpleName}"
+            } finally { busy = false; cloudPush() }
+        }
+    }
+
+    /** Sadece harf tanıma: raf + tahtadaki harfleri okur, bilinmeyenleri sorar. AI yok, plan yok. */
+    private fun recognize() {
+        if (busy) return
+        busy = true; status.text = "Ekran yakalanıyor…"
+        scope.launch {
+            try {
+                val bmp = capture()
+                val r = withTimeoutOrNull(300_000) {
+                    withContext(Dispatchers.Default) {
+                        controller.recognizeLetters(bmp, { c, g, n -> askLetter(c, g, n) }) { msg ->
+                            status.post { status.text = msg }
+                        }
+                    }
+                } ?: error("Zaman aşımı.")
+                markers.clear()
+                status.text = "Harf tanıma bitti.\n" +
+                    "Raf: ${r.rack.joinToString("")}\n" +
+                    "Tahtadaki harf: ${r.boardKnown}/${r.boardFilled}\n" +
+                    (if (r.unresolved > 0) "Tanınmayan: ${r.unresolved} (tekrar bas)"
+                    else "Hepsi tanındı. Analiz'e basabilirsin.")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                android.util.Log.e("CrossUp", "recognize", e)
                 status.text = "Hata: ${e.message ?: e.javaClass.simpleName}"
             } finally { busy = false; cloudPush() }
         }
