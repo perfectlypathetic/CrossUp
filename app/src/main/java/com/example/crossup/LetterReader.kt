@@ -30,6 +30,10 @@ class LetterReader(ctx: Context) {
     private val db = LetterDb.get(ctx)
     private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
 
+    /** Son read() çağrısında harfi bulunamayan karo sayısı (raf + tahta). */
+    @Volatile var lastUnresolved: Int = 0
+        private set
+
     private class Item(val rackIdx: Int, val cell: CellPos?, val crop: Bitmap, val fp: Fp) {
         var ch: Char? = null
         var skipped = false
@@ -82,6 +86,8 @@ class LetterReader(ctx: Context) {
                 next.ch = answer
             }
         }
+
+        lastUnresolved = items.count { it.ch == null }
 
         val rack = items.filter { it.rackIdx >= 0 && it.ch != null }
             .sortedBy { it.rackIdx }.map { it.ch!! }
