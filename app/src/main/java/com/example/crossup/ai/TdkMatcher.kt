@@ -17,9 +17,10 @@ import kotlin.coroutines.resume
 
 /**
  * TDK ile çevrimdışı ipucu çözücü.
+ *  0) "... SİMGESİ" ipuçları: element tablosundan (OKSİJEN -> O, AZOT -> N ...).
  *  1) readClue: ipucu görüntüsünü ML Kit ile okur (yazı yoksa boş döner).
  *  2) candidates: yazıdan kök çıkarır, uzunluğa ve desene uyan kelimeleri tanım örtüşmesine göre sıralar.
- * Güven düşükse candidates null döner; çağıran taraf Gemini'ye geçer.
+ * Güven düşükse candidates null döner.
  */
 class TdkMatcher(ctx: Context) {
     private val db = TdkDb.get(ctx)
@@ -32,8 +33,10 @@ class TdkMatcher(ctx: Context) {
     companion object {
         private const val TAG = "TdkMatcher"
 
-        /** En iyi adayın puanı bundan düşükse güvenme (null dön). Ayar: büyütürsen daha temkinli olur. */
+        /** En iyi adayın puanı bundan düşükse güvenme (null dön). */
         const val MIN_TOP = 3.0
+        /** 1-2 harflik cevaplarda tanım eşleşmesi çok gürültülü: daha yüksek puan şart. */
+        const val MIN_TOP_SHORT = 7.0
         /** En iyi puanın bu oranından düşük adaylar listeye girmez. */
         const val KEEP_RATIO = 0.5
         /** En fazla kaç aday döner. */
@@ -44,6 +47,22 @@ class TdkMatcher(ctx: Context) {
         const val MIN_LETTERS = 4
         /** OCR öncesi görüntü bu yüksekliğe (piksel) büyütülür (en çok 4 kat). */
         private const val TARGET_H = 360f
+
+        /** Element adı (aksansız, küçük harf) -> sembol. Semboller bilerek büyük harfle yazıldı. */
+        private val ELEMENTS: List<Pair<String, String>> = listOf(
+            "hidrojen" to "H", "helyum" to "HE", "lityum" to "LI", "berilyum" to "BE", "bor" to "B",
+            "karbon" to "C", "azot" to "N", "oksijen" to "O", "flor" to "F", "neon" to "NE",
+            "sodyum" to "NA", "magnezyum" to "MG", "aluminyum" to "AL", "silisyum" to "SI",
+            "fosfor" to "P", "kukurt" to "S", "klor" to "CL", "argon" to "AR", "potasyum" to "K",
+            "kalsiyum" to "CA", "titanyum" to "TI", "vanadyum" to "V", "krom" to "CR", "mangan" to "MN",
+            "demir" to "FE", "kobalt" to "CO", "nikel" to "NI", "bakir" to "CU", "cinko" to "ZN",
+            "galyum" to "GA", "germanyum" to "GE", "arsenik" to "AS", "selenyum" to "SE", "brom" to "BR",
+            "kripton" to "KR", "zirkonyum" to "ZR", "molibden" to "MO", "gumus" to "AG", "kadmiyum" to "CD",
+            "kalay" to "SN", "antimon" to "SB", "iyot" to "I", "ksenon" to "XE", "baryum" to "BA",
+            "volfram" to "W", "platin" to "PT", "altin" to "AU", "civa" to "HG", "kursun" to "PB",
+            "bizmut" to "BI", "radyum" to "RA", "radon" to "RN", "uranyum" to "U", "plutonyum" to "PU",
+            "kurcatovyum" to "KU"
+        ).sortedByDescending { it.first.length }
     }
 
     /** Sözlüğü yükler (ilk seferde ~0,5 sn). Başarılıysa true. */
@@ -72,17 +91,35 @@ class TdkMatcher(ctx: Context) {
         }
     }
 
+    /** "OKSİJENİN SİMGESİ" gibi ipuçları için element sembolü. Uymazsa null. */
+    private fun elementSymbol(clueText: String, length: Int, pattern: String): String? {
+        val compact = TdkDb.fold(clueText).filter { it in 'a'..'z' }
+        if (!compact.contains("simge") && !compact.contains("sembol")) return null
+        for ((name, sym) in ELEMENTS) {
+            if (compact.startsWith(name)) {
+                if (sym.length != length) return null
+                for (i in sym.indices) if (pattern[i] != '?' && pattern[i] != sym[i]) return null
+                return sym
+            }
+        }
+        return null
+    }
+
     /**
      * OCR metninden aday üretir.
-     * null  = güven düşük / yazı yok / TDK'da uygun kelime yok -> Gemini'ye git.
+     * null  = güven düşük / yazı yok / TDK'da uygun kelime yok.
      * liste = en olası adaylar (weight: en iyiye göre göreli).
-     * Sonucun nedeni lastReason'da durur.
      */
     fun candidates(clueText: String, length: Int, pattern: String): List<Candidate>? {
         lastReason = ""
         if (!db.isLoaded) { lastReason = "sözlük yüklü değil"; return null }
         if (clueText.count { it.isLetter() } < MIN_LETTERS) {
             lastReason = "yazı okunamadı (resimli?)"; return null
+        }
+
+        elementSymbol(clueText, length, pattern)?.let { sym ->
+            lastReason = "ÇÖZÜLDÜ (element): $sym"
+            return listOf(Candidate(sym, 1.0))
         }
 
         val q = TdkDb.stems(clueText)
@@ -92,7 +129,8 @@ class TdkMatcher(ctx: Context) {
         if (hits.isEmpty()) { lastReason = "sözlükte eşleşme yok"; return null }
 
         val top = hits[0].score
-        if (top < MIN_TOP) {
+        val minTop = if (length <= 2) MIN_TOP_SHORT else MIN_TOP
+        if (top < minTop) {
             lastReason = "düşük güven (" + String.format("%.1f", top) + ") en iyi: " + hits.first().word
             Log.d(TAG, "düşük güven: \"" + clueText + "\" -> " + hits.first().word)
             return null
