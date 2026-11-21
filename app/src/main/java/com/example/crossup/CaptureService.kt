@@ -116,6 +116,11 @@ class CaptureService : Service() {
             addView(btn("Sıradaki ▶") { controller.turns.advance(); status.text = controller.turns.label })
             addView(btn("✕") { stopSelf() })
         }
+        // İkinci satır: sadece veritabanını güçlendirir, analiz/plan yapmaz.
+        val row2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btn("Öğren (kaydet)") { learn() })
+        }
 
         val dm = resources.displayMetrics
         panelLp = WindowManager.LayoutParams(
@@ -147,7 +152,7 @@ class CaptureService : Service() {
 
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(0xCC000000.toInt()); setPadding(16, 0, 16, 8)
-            addView(handle); addView(status); addView(row)
+            addView(handle); addView(status); addView(row); addView(row2)
         }
         wm.addView(panel, panelLp)
     }
@@ -168,6 +173,32 @@ class CaptureService : Service() {
                 throw e
             } catch (e: Throwable) {
                 android.util.Log.e("CrossUp", "analyze", e)
+                status.text = "Hata: ${e.message ?: e.javaClass.simpleName}"
+            } finally { busy = false }
+        }
+    }
+
+    /** Sadece öğrenme: ekrandaki dolu yuvaları veritabanına kaydeder. */
+    private fun learn() {
+        if (busy) return
+        busy = true; status.text = "Ekran yakalanıyor…"
+        scope.launch {
+            try {
+                val bmp = capture()
+                val r = withTimeoutOrNull(60_000) {
+                    withContext(Dispatchers.Default) {
+                        controller.learn(bmp) { msg -> status.post { status.text = msg } }
+                    }
+                } ?: error("Zaman aşımı (60 sn). İnternet/API anahtarı/kota kontrol et.")
+                markers.clear()
+                status.text = "Öğrenme bitti.\n" +
+                    "Dolu yuva: ${r.fullSlots} → yeni kelime: ${r.added}\n" +
+                    (if (r.unreadCells > 0) "Okunamayan hücre: ${r.unreadCells} (tekrar bas)\n" else "") +
+                    "Kayıtlı toplam: ${r.total}"
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                android.util.Log.e("CrossUp", "learn", e)
                 status.text = "Hata: ${e.message ?: e.javaClass.simpleName}"
             } finally { busy = false }
         }
@@ -203,6 +234,7 @@ class MarkerView(ctx: Context) : View(ctx) {
     private val bg = Paint().apply { color = 0xCCE53935.toInt(); style = Paint.Style.FILL }
     private val tx = Paint().apply { color = Color.WHITE; textAlign = Paint.Align.CENTER; isFakeBoldText = true; isAntiAlias = true }
     fun set(x: Analysis) { a = x; invalidate() }
+    fun clear() { a = null; invalidate() }
     override fun onDraw(c: Canvas) {
         val an = a ?: return
         for (pl in an.plan.placements) {
