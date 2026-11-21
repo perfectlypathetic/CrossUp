@@ -19,7 +19,7 @@ object Models {
         "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-robotics-er-2-preview"
     )
 
-    /** İpucu çözme: çok sayıda paralel istek -> kotayı yaymak için 3.6 ile başla, Gemma en sonda. */
+    /** İpucu çözme: artık tek toplu istek -> en güçlü modeller önce, Gemma en sonda. */
     val SOLVER = listOf(
         "gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.5-flash", "gemini-3-flash-preview",
         "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-flash-lite-preview",
@@ -28,6 +28,12 @@ object Models {
 }
 
 class ApiError(val code: Int, message: String) : Exception(message)
+
+/** İstek parçası: metin veya resim. Parçalar verilen sırayla gönderilir. */
+sealed class ReqPart {
+    class Text(val text: String) : ReqPart()
+    class Image(val bytes: ByteArray, val mime: String) : ReqPart()
+}
 
 object GeminiHttp {
     private const val TAG = "GeminiHttp"
@@ -48,18 +54,27 @@ object GeminiHttp {
         return if (ok.isNotEmpty()) ok else chain.sortedBy { cooldown[it] ?: 0L }
     }
 
+    /** Tek resim + metin (tahta/raf okuma için). */
     suspend fun askImage(
         apiKey: String, chain: List<String>, image: ByteArray, mime: String,
         prompt: String, maxTokens: Int
+    ): String = askParts(
+        apiKey, chain, listOf(ReqPart.Image(image, mime), ReqPart.Text(prompt)), maxTokens
+    )
+
+    /** Birden çok metin/resim parçası (toplu ipucu çözme için). */
+    suspend fun askParts(
+        apiKey: String, chain: List<String>, parts: List<ReqPart>, maxTokens: Int,
+        readTimeoutMs: Int = 15_000
     ): String = withContext(Dispatchers.IO) {
         var last = "bilinmiyor"
         for (model in order(chain).take(MAX_TRIES)) {
             try {
                 val out = try {
-                    call(apiKey, model, image, mime, prompt, maxTokens, plain = model.startsWith("gemma"))
+                    call(apiKey, model, parts, maxTokens, plain = model.startsWith("gemma"), readTimeoutMs = readTimeoutMs)
                 } catch (e: ApiError) {
                     // 400: bu model thinkingConfig / JSON modunu desteklemiyor olabilir -> sade ayarla bir kez daha dene.
-                    if (e.code == 400 && !isKeyError(e)) call(apiKey, model, image, mime, prompt, maxTokens, plain = true)
+                    if (e.code == 400 && !isKeyError(e)) call(apiKey, model, parts, maxTokens, plain = true, readTimeoutMs = readTimeoutMs)
                     else throw e
                 }
                 lastModel = model
@@ -91,26 +106,35 @@ object GeminiHttp {
         e.message?.contains("API_KEY", ignoreCase = true) == true
 
     private fun call(
-        apiKey: String, model: String, image: ByteArray, mime: String,
-        prompt: String, maxTokens: Int, plain: Boolean
+        apiKey: String, model: String, parts: List<ReqPart>,
+        maxTokens: Int, plain: Boolean, readTimeoutMs: Int
     ): String {
         val gen = JSONObject().put("maxOutputTokens", maxOf(maxTokens, 1024))
         if (!plain) {
             gen.put("responseMimeType", "application/json")
             gen.put("thinkingConfig", JSONObject().put("thinkingLevel", "minimal"))
         }
+        val partsJson = JSONArray()
+        for (p in parts) {
+            partsJson.put(
+                when (p) {
+                    is ReqPart.Text -> JSONObject().put("text", p.text)
+                    is ReqPart.Image -> JSONObject().put(
+                        "inlineData", JSONObject()
+                            .put("mimeType", p.mime)
+                            .put("data", Base64.encodeToString(p.bytes, Base64.NO_WRAP))
+                    )
+                }
+            )
+        }
         val body = JSONObject()
-            .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray()
-                .put(JSONObject().put("inlineData", JSONObject()
-                    .put("mimeType", mime)
-                    .put("data", Base64.encodeToString(image, Base64.NO_WRAP))))
-                .put(JSONObject().put("text", prompt)))))
+            .put("contents", JSONArray().put(JSONObject().put("parts", partsJson)))
             .put("generationConfig", gen)
 
         val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"; doOutput = true
-            connectTimeout = 8_000; readTimeout = 15_000
+            connectTimeout = 8_000; readTimeout = readTimeoutMs
             setRequestProperty("content-type", "application/json")
             setRequestProperty("x-goog-api-key", apiKey)
         }
@@ -121,10 +145,10 @@ object GeminiHttp {
                 ?.bufferedReader()?.readText() ?: ""
             if (code !in 200..299) throw ApiError(code, resp.take(200))
 
-            val parts = JSONObject(resp).optJSONArray("candidates")?.optJSONObject(0)
+            val respParts = JSONObject(resp).optJSONArray("candidates")?.optJSONObject(0)
                 ?.optJSONObject("content")?.optJSONArray("parts")
                 ?: throw IllegalStateException("Boş cevap (güvenlik filtresi?)")
-            val text = (0 until parts.length()).map { parts.getJSONObject(it) }
+            val text = (0 until respParts.length()).map { respParts.getJSONObject(it) }
                 .filter { !it.optBoolean("thought", false) }
                 .joinToString("") { it.optString("text", "") }
             val s = text.indexOfFirst { it == '[' || it == '{' }
