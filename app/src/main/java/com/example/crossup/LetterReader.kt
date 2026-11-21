@@ -23,7 +23,7 @@ const val TR_ALPHABET = "ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZ"
 
 /**
  * Yapay zekasız harf okuyucu.
- * Sıra: 1) şablon eşleştirme  2) ML Kit tahmini (sadece öneri)  3) kullanıcıya sor.
+ * Sıra: 1) şablon eşleştirme  2) ML Kit tahmini (sadece öneri; tüm harfler kayıtlıysa yapılmaz)  3) kullanıcıya sor.
  * Sadece kullanıcının onayladığı harfler şablon olarak kaydedilir.
  */
 class LetterReader(ctx: Context) {
@@ -115,19 +115,25 @@ class LetterReader(ctx: Context) {
         return bmp.crop(Rect(r.x0 + dx, r.y0 + dy, r.x1 - dx, r.y1 - dy))
     }
 
-    /** ML Kit ile tek harf tahmini (sadece öneri). */
-    private suspend fun guess(crop: Bitmap): Char? = try {
-        val big = Bitmap.createScaledBitmap(crop, crop.width * 2, crop.height * 2, true)
-        val text = suspendCancellableCoroutine<String> { cont ->
-            recognizer.process(InputImage.fromBitmap(big, 0))
-                .addOnSuccessListener { t -> if (cont.isActive) cont.resume(t.text) }
-                .addOnFailureListener { if (cont.isActive) cont.resume("") }
+    /**
+     * ML Kit ile tek harf tahmini (sadece öneri).
+     * Tüm harflerin şablonu zaten kayıtlıysa tahmin yapılmaz (null döner).
+     */
+    private suspend fun guess(crop: Bitmap): Char? {
+        if (db.hasAll(TR_ALPHABET)) return null
+        return try {
+            val big = Bitmap.createScaledBitmap(crop, crop.width * 2, crop.height * 2, true)
+            val text = suspendCancellableCoroutine<String> { cont ->
+                recognizer.process(InputImage.fromBitmap(big, 0))
+                    .addOnSuccessListener { t -> if (cont.isActive) cont.resume(t.text) }
+                    .addOnFailureListener { if (cont.isActive) cont.resume("") }
+            }
+            text.trim().uppercase(TR).firstOrNull { it in TR_ALPHABET }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
         }
-        text.trim().uppercase(TR).firstOrNull { it in TR_ALPHABET }
-    } catch (e: CancellationException) {
-        throw e
-    } catch (e: Exception) {
-        null
     }
 
     // ---------- raf konumu ----------
