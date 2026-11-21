@@ -293,7 +293,9 @@ class GameController(apiKey: String, ctx: Context) {
             }
             if (DEBUG_TDK) {
                 if (isNotEmpty()) append("\n")
-                append("[TDK teşhis] sözlük: ${if (tdk.ready) "yüklü" else "YÜKLÜ DEĞİL"}")
+                append("[TDK teşhis] sözlük: ")
+                if (tdk.ready) append("yüklü")
+                else append("YÜKLÜ DEĞİL (${tdk.loadError.ifEmpty { "sebep bilinmiyor" }})")
                 for (line in tdkDebug.take(8)) append("\n").append(line)
                 if (tdkDebug.size > 8) append("\n… +${tdkDebug.size - 8} ipucu daha")
             }
