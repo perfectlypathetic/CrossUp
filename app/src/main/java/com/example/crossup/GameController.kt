@@ -6,6 +6,7 @@ import com.example.crossup.ai.ClueDb
 import com.example.crossup.ai.GeminiBoardReader
 import com.example.crossup.ai.GeminiClueSolver
 import com.example.crossup.parser.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -45,12 +46,22 @@ class Analysis(
     val note: String
 )
 
+/** "Öğren" butonunun sonucu. */
+class LearnResult(
+    val fullSlots: Int,      // tamamen dolu yuva sayısı
+    val added: Int,          // veritabanına yeni eklenen kelime sayısı
+    val unreadCells: Int,    // harfi okunamayan dolu hücre sayısı
+    val total: Int           // veritabanındaki toplam kelime
+)
+
 class GameController(apiKey: String, ctx: Context) {
     companion object {
         /** Bir analizde yapay zekaya en fazla kaç ipucu sorulsun (kota koruması). */
         const val MAX_AI_PER_ANALYSIS = 12
         /** Üst üste bu kadar AI hatasında o analizde AI'a sormayı bırak. */
         const val MAX_AI_FAILS = 2
+        /** Öğrenme modunda tek istekte okunacak en fazla hücre sayısı. */
+        const val LEARN_CHUNK = 20
     }
 
     private val parser = GridParser()
@@ -65,6 +76,59 @@ class GameController(apiKey: String, ctx: Context) {
     /** Bu yuva için AI'a en son hangi desenle soruldu. Aynı desenle tekrar sorulmaz. */
     private val asked = ConcurrentHashMap<WordSlot, String>()
 
+    /** Yeni oyun mu? İpucu hücrelerinin düzeni değiştiyse her şeyi sıfırla. */
+    private fun syncSignature(board: ParsedBoard) {
+        val sig = board.slots.joinToString("|") { "${it.dir}${it.clueCell.r},${it.clueCell.c}:${it.length}" }
+        if (sig != signature) {
+            signature = sig; letterCache.clear(); candCache.clear(); asked.clear(); turns.reset()
+        }
+    }
+
+    /**
+     * ÖĞREN: Analiz yapmaz, plan çıkarmaz, ipucu çözdürmez.
+     * Sadece tahtadaki harfleri okur ve tamamen dolu yuvaları veritabanına kaydeder.
+     */
+    suspend fun learn(bmp: Bitmap, progress: (String) -> Unit = {}): LearnResult {
+        progress("Izgara aranıyor…")
+        val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
+        syncSignature(board)
+
+        val filled = board.cellsOf(CellKind.FILLED)
+        val need = filled.filter { it !in letterCache }
+        val chunks = need.chunked(LEARN_CHUNK)
+        val jpeg = if (chunks.isNotEmpty()) bmp.toJpeg() else ByteArray(0)
+
+        var failures = 0
+        for ((i, chunk) in chunks.withIndex()) {
+            progress("Harfler okunuyor ${i + 1}/${chunks.size}…")
+            try {
+                val reading = reader.read(jpeg, board, chunk)
+                for (p in chunk) reading.letters[p]?.let { letterCache[p] = it }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                failures++
+            }
+        }
+        if (failures > 0 && failures == chunks.size) error("Harfler okunamadı (internet/API anahtarı/kota?)")
+
+        val known = HashMap<CellPos, Char>()
+        for (p in filled) letterCache[p]?.let { known[p] = it }
+
+        progress("Veritabanına kaydediliyor…")
+        val before = db.size()
+        var full = 0
+        for (s in board.slots) {
+            if (s.cells.all { it in known }) {
+                full++
+                db.put(db.key(bmp.crop(s.clueRect)), s.cells.map { known[it]!! }.joinToString(""))
+            }
+        }
+        val after = db.size()
+        val unread = filled.count { it !in known }
+        return LearnResult(full, after - before, unread, after)
+    }
+
     suspend fun analyze(bmp: Bitmap, progress: (String) -> Unit = {}): Analysis {
         // Yapay zekaya ayrılan toplam süre sınırı (ms). Bu süreden sonra yeni ipucu sorulmaz.
         val deadline = System.currentTimeMillis() + 30_000
@@ -73,11 +137,7 @@ class GameController(apiKey: String, ctx: Context) {
         val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
         progress("Izgara ${board.rows}x${board.cols}, ${board.slots.size} yuva. Harfler okunuyor…")
 
-        // Yeni oyun mu? İpucu hücrelerinin düzeni değiştiyse her şeyi sıfırla.
-        val sig = board.slots.joinToString("|") { "${it.dir}${it.clueCell.r},${it.clueCell.c}:${it.length}" }
-        if (sig != signature) {
-            signature = sig; letterCache.clear(); candCache.clear(); asked.clear(); turns.reset()
-        }
+        syncSignature(board)
 
         val st = GameState(board)
         val filled = board.cellsOf(CellKind.FILLED)
