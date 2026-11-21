@@ -71,10 +71,16 @@ class GameController(apiKey: String, ctx: Context) {
     companion object {
         /** Bir analizde AI ile ipucu çözmeye ayrılan toplam süre. */
         const val AI_TIME_LIMIT_MS = 120_000L
+
+        /**
+         * Yapay zeka şalteri. false = AI hiç kullanılmaz (kota harcanmaz, API anahtarı gerekmez).
+         * Tekrar açmak istersen true yap.
+         */
+        const val USE_AI = false
     }
 
     private val parser = GridParser()
-    private val solver = GeminiClueSolver(apiKey)
+    private val solver by lazy { GeminiClueSolver(apiKey) }
     private val letters = LetterReader(ctx)
     private val db = ClueDb.get(ctx)
     private val tdk = TdkMatcher(ctx)
@@ -164,7 +170,8 @@ class GameController(apiKey: String, ctx: Context) {
     /**
      * ANALİZ: Harf sormaz (sadece kayıtlı şablonlarla okur).
      * Sadece RAFTAKİ harfler okunamazsa durur. Tahtadaki tanınmayan hücreler yok sayılır.
-     * İpuçları: önce bellek, telefondaki veritabanı ve TDK sözlüğü; kalanlar TEK TOPLU istekle AI'a sorulur.
+     * İpuçları: önce bellek, telefondaki veritabanı ve TDK sözlüğü.
+     * USE_AI açıksa kalanlar TEK TOPLU istekle AI'a sorulur; kapalıysa çözümsüz kalır.
      */
     suspend fun analyze(bmp: Bitmap, progress: (String) -> Unit = {}): Analysis {
         progress("Izgara aranıyor…")
@@ -174,6 +181,7 @@ class GameController(apiKey: String, ctx: Context) {
         syncSignature(board)
         lastAiError = ""
         tdkHits = 0
+        var unsolvedNoAi = 0
 
         val st = GameState(board)
         val filled = board.cellsOf(CellKind.FILLED)
@@ -218,9 +226,12 @@ class GameController(apiKey: String, ctx: Context) {
         }
         if (tdkHits > 0) progress("TDK ile $tdkHits ipucu çözüldü, ${pending.size} ipucu kaldı")
 
-        // 2. aşama: kalanlar tek toplu AI isteğiyle (SON ÇARE).
+        // 2. aşama: kalanlar (SON ÇARE: AI). Şalter kapalıysa AI'a hiç sorulmaz.
         if (pending.isNotEmpty()) {
-            if (deadline - System.currentTimeMillis() < 3000) {
+            if (!USE_AI) {
+                unsolvedNoAi = pending.size
+                for (p in pending) results[p.slot] = emptyList()
+            } else if (deadline - System.currentTimeMillis() < 3000) {
                 lastAiError = "süre doldu"
                 for (p in pending) results[p.slot] = emptyList()
             } else {
@@ -263,6 +274,10 @@ class GameController(apiKey: String, ctx: Context) {
                 if (isNotEmpty()) append("\n")
                 append("TDK ile çözülen: $tdkHits ipucu")
             }
+            if (unsolvedNoAi > 0) {
+                if (isNotEmpty()) append("\n")
+                append("$unsolvedNoAi ipucu çözülemedi (yapay zeka kapalı).")
+            }
             if (lastAiError.isNotEmpty()) {
                 if (isNotEmpty()) append("\n")
                 append("Yapay zeka cevap vermedi (kota dolmuş olabilir). Sonuç eksik, biraz sonra tekrar Analiz'e bas.")
@@ -289,7 +304,7 @@ class GameController(apiKey: String, ctx: Context) {
         if (hit.isNotEmpty()) return hit.map { Candidate(it, 1.0) }.also { candCache[key] = it }
 
         // 3) TDK sözlüğü: ipucu yazısı bir kez okunur (OCR), her seferinde güncel desenle aranır.
-        //    Güven düşükse / resimli ipucuysa null döner ve Gemini'ye geçilir.
+        //    Güven düşükse / resimli ipucuysa null döner.
         if (tdk.ready && key !in asked) {
             var text = ocrCache[key]
             if (text == null) {
