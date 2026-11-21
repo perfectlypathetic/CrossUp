@@ -9,6 +9,8 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Son 4 tur sırası. Kullanıcı butonla başlatır; her turdan sonra "ilerle" ile bir adım atlanır. */
 class TurnTracker {
@@ -48,10 +50,12 @@ class GameController(apiKey: String) {
 
     private var signature = ""
     private val letterCache = HashMap<CellPos, Char>()
-    private val candCache = HashMap<WordSlot, List<Candidate>>()
+    private val candCache = ConcurrentHashMap<WordSlot, List<Candidate>>()
 
-    suspend fun analyze(bmp: Bitmap): Analysis {
+    suspend fun analyze(bmp: Bitmap, progress: (String) -> Unit = {}): Analysis {
+        progress("Izgara aranıyor…")
         val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
+        progress("Izgara ${board.rows}x${board.cols}, ${board.slots.size} yuva. Harfler okunuyor…")
 
         // Yeni oyun mu? İpucu hücrelerinin düzeni değiştiyse her şeyi sıfırla.
         val sig = board.slots.joinToString("|") { "${it.dir}${it.clueCell.r},${it.clueCell.c}:${it.length}" }
@@ -66,13 +70,24 @@ class GameController(apiKey: String) {
         if (reading.rack.isEmpty()) error("Raftaki harfler okunamadı")
 
         // İpucu çözümü: sadece henüz bitmemiş yuvalar, en fazla 4 paralel istek.
+        val todo = board.slots.filter { st.emptyIn(it) > 0 }
+        val done = AtomicInteger(0)
+        progress("Raf: ${reading.rack.joinToString("")} — ipuçları çözülüyor 0/${todo.size}")
         val sem = Semaphore(4)
-        coroutineScope {
-            board.slots.filter { st.emptyIn(it) > 0 }.map { s ->
-                async { sem.withPermit { st.cands[s] = candsFor(s, st, bmp) } }
+        val results = coroutineScope {
+            todo.map { s ->
+                async {
+                    sem.withPermit {
+                        val c = candsFor(s, st, bmp)
+                        progress("İpuçları çözülüyor ${done.incrementAndGet()}/${todo.size}")
+                        s to c
+                    }
+                }
             }.awaitAll()
         }
+        for ((s, c) in results) st.cands[s] = c      // tek thread'de yaz
 
+        progress("Hamle planlanıyor…")
         val ctx = if (turns.endgame)
             TurnContext(true, turns.myTurnsLeft.coerceAtLeast(1), turns.oppAfterNextMine)
         else Phase.context(st, 99, 1).let { TurnContext(false, it.myMovesLeft, it.opponentMovesAfterMe) }
@@ -87,7 +102,7 @@ class GameController(apiKey: String) {
     }
 
     private suspend fun candsFor(s: WordSlot, st: GameState, bmp: Bitmap): List<Candidate> {
-        val pattern = s.cells.map { st.known[it] ?: '?' }.joinToString("").let { it }
+        val pattern = s.cells.map { st.known[it] ?: '?' }.joinToString("")
         fun fits(w: String) = w.indices.all { pattern[it] == '?' || pattern[it] == w[it] }
         candCache[s]?.let { c -> if (c.any { fits(it.word) }) return c }
         return try {
