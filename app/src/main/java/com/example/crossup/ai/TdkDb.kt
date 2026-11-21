@@ -3,6 +3,7 @@ package com.example.crossup.ai
 import android.content.Context
 import android.util.Log
 import com.example.crossup.game.TR
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import kotlin.math.ln
@@ -11,7 +12,8 @@ import kotlin.math.ln
 class TdkHit(val word: String, val score: Double)
 
 /**
- * TDK sözlüğü (assets/tdk.txt). Açılışta bir kez belleğe yüklenir.
+ * TDK sözlüğü. Önce telefondaki yüklenmiş kopyaya (filesDir/tdk.txt), yoksa assets/tdk.txt'ye bakar.
+ * Açılışta bir kez belleğe yüklenir.
  * Dosya biçimi: her satır "KELİME<TAB>kök1 kök2 kök3 ..." (kökler aksansız, ilk 5 harf).
  * Kelimeler harf sayısına göre gruplanır; arama sadece ilgili uzunluktaki gruba bakar.
  */
@@ -96,11 +98,15 @@ class TdkDb private constructor(private val ctx: Context) {
         }
     }
 
+    private fun localFile() = File(ctx.filesDir, "tdk.txt")
+
     /**
-     * tdk.txt'yi açar. Bulunamazsa adı "tdk" ile başlayan başka bir dosyayı dener.
+     * Sözlük dosyasını açar: 1) telefona yüklenmiş kopya  2) assets/tdk.txt  3) assets'te adı "tdk" ile başlayan dosya.
      * Hiçbiri yoksa assets içinde ne olduğunu hata mesajına yazar.
      */
     private fun openAsset(): InputStream {
+        val local = localFile()
+        if (local.exists() && local.length() > 0) return local.inputStream()
         try {
             return ctx.assets.open(ASSET)
         } catch (e: IOException) {
@@ -109,6 +115,30 @@ class TdkDb private constructor(private val ctx: Context) {
             if (alt != null) return ctx.assets.open(alt)
             val found = if (names.isEmpty()) "assets klasörü boş/yok" else names.take(8).joinToString(",")
             throw IOException("assets'te tdk.txt yok. Bulunanlar: $found")
+        }
+    }
+
+    /**
+     * Kullanıcının seçtiği tdk.txt dosyasını telefona kopyalar ve yükler.
+     * Arka plan iş parçacığında çağır. Başarılıysa true.
+     */
+    @Synchronized
+    fun installFrom(inp: InputStream): Boolean {
+        return try {
+            val f = localFile()
+            val t = File(ctx.filesDir, "tdk.txt.tmp")
+            t.outputStream().use { out -> inp.copyTo(out) }
+            if (t.length() == 0L) throw IOException("seçilen dosya boş")
+            f.delete()
+            if (!t.renameTo(f)) {
+                t.copyTo(f, overwrite = true)
+                t.delete()
+            }
+            isLoaded = false
+            ensureLoaded()
+        } catch (e: Throwable) {
+            lastError = (e.message ?: e.javaClass.simpleName).take(120)
+            false
         }
     }
 
