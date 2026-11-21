@@ -159,3 +159,39 @@ class MainActivity : Activity() {
             }
             REQ_CLOUD_NEW, REQ_CLOUD_PICK -> {
                 val uri = data.data ?: return
+                CloudSync.setUri(this, uri, data.flags)
+                Toast.makeText(this, "Eşitleniyor…", Toast.LENGTH_SHORT).show()
+                Thread {
+                    val msg = CloudSync.sync(applicationContext)
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
+                        refreshInfo()
+                    }
+                }.start()
+            }
+            REQ_EXPORT -> {
+                val uri = data.data ?: return
+                Thread {
+                    val msg = try {
+                        contentResolver.openOutputStream(uri, "wt")!!.use { CloudSync.exportTo(this@MainActivity, it) }
+                        "Yedek kaydedildi."
+                    } catch (e: Exception) { "Hata: ${e.message}" }
+                    runOnUiThread { Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show() }
+                }.start()
+            }
+            REQ_IMPORT -> {
+                val uri = data.data ?: return
+                Thread {
+                    val msg = try {
+                        val added = contentResolver.openInputStream(uri)!!.use { CloudSync.importFrom(this@MainActivity, it) }
+                        "$added yeni kayıt eklendi."
+                    } catch (e: Exception) { "Okunamadı: ${e.message}" }
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
+                        refreshInfo()
+                    }
+                }.start()
+            }
+        }
+    }
+}
