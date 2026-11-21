@@ -123,7 +123,7 @@ class CaptureService : Service() {
 
         status = TextView(this).apply {
             setTextColor(Color.WHITE); textSize = 13f
-            text = "Hazır. Önce 'Harfleri tanı', sonra 'Analiz'."
+            text = "Hazır. 'Analiz'e bas."
         }
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -207,7 +207,7 @@ class CaptureService : Service() {
 
                 box.addView(TextView(this@CaptureService).apply {
                     setTextColor(Color.WHITE); textSize = 14f
-                    text = "Bu harf hangisi? (kalan: $remaining)" +
+                    text = "Bu harf hangisi? (kalan: $remaining)\nHarf değilse 'Atla'ya bas." +
                         (if (guess != null) "\nTahmin: $guess (yeşil)" else "")
                 })
                 box.addView(ImageView(this@CaptureService).apply {
@@ -284,11 +284,9 @@ class CaptureService : Service() {
                     }
                 } ?: error("Zaman aşımı.")
                 markers.clear()
-                status.text = "Harf tanıma bitti.\n" +
-                    "Raf: ${r.rack.joinToString("")}\n" +
-                    "Tahtadaki harf: ${r.boardKnown}/${r.boardFilled}\n" +
-                    (if (r.unresolved > 0) "Tanınmayan: ${r.unresolved} (tekrar bas)"
-                    else "Hepsi tanındı. Analiz'e basabilirsin.")
+                status.text = "Raf: ${r.rack.joinToString("")}\n" +
+                    (if (r.rackMissing > 0) "Raftaki ${r.rackMissing} harf tanınmadı (tekrar bas)."
+                    else "Raf tamam. Analiz'e basabilirsin.")
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
@@ -326,13 +324,14 @@ class CaptureService : Service() {
         }
     }
 
+    /** Sonucu göster: ekranda sadece koyulacak harfler işaretlenir, panelde kısa özet yazar. */
     private fun show(a: Analysis) {
         markers.set(a)
-        val moves = if (a.plan.pass) "PAS" else a.plan.placements.joinToString("  ") {
-            "${it.letter}→(${it.cell.r + 1},${it.cell.c + 1}) %${(it.p * 100).toInt()}"
+        val moves = if (a.plan.pass) "PAS (güvenli hamle yok)" else a.plan.placements.joinToString("   ") {
+            "${it.letter} → (${it.cell.r + 1},${it.cell.c + 1})"
         }
-        status.text = "Raf: ${a.rack.joinToString("")}\n$moves  EV=${"%.1f".format(a.plan.expectedValue)}\n" +
-            "Kırmızı=plan, turuncu=rafta var, mavi=diğer tahmin\n${a.note}"
+        status.text = "Raf: ${a.rack.joinToString("")}\n$moves" +
+            (if (a.note.isNotEmpty()) "\n${a.note}" else "")
     }
 
     private fun notification(): Notification {
@@ -353,42 +352,18 @@ class CaptureService : Service() {
 
 /**
  * Hücrelerin üstüne çizer (ekran görüntüsü koordinatı = ekran koordinatı).
- *  - Kırmızı büyük daire: planın önerdiği hamle.
- *  - Turuncu: en olası harf, rafında var.
- *  - Mavi: en olası harf, rafında yok (sonraki turlar için bilgi).
+ * Sadece planın önerdiği hamleler: kırmızı daire içinde koyulacak harf.
  */
 class MarkerView(ctx: Context) : View(ctx) {
     private var a: Analysis? = null
     private val bg = Paint().apply { color = 0xCCE53935.toInt(); style = Paint.Style.FILL }
-    private val bgRack = Paint().apply { color = 0xCCFB8C00.toInt(); style = Paint.Style.FILL }
-    private val bgGuess = Paint().apply { color = 0xAA1E88E5.toInt(); style = Paint.Style.FILL }
     private val tx = Paint().apply { color = Color.WHITE; textAlign = Paint.Align.CENTER; isFakeBoldText = true; isAntiAlias = true }
-    private val small = Paint().apply { color = Color.BLACK; textAlign = Paint.Align.CENTER; isFakeBoldText = true; isAntiAlias = true }
 
     fun set(x: Analysis) { a = x; invalidate() }
     fun clear() { a = null; invalidate() }
 
     override fun onDraw(c: Canvas) {
         val an = a ?: return
-        val planned = an.plan.placements.map { it.cell }.toSet()
-        val rackSet = an.rack.toSet()
-
-        // Tüm bulmaca tahmini (önce çizilir, planın altında kalır).
-        for ((cell, g) in an.guesses) {
-            if (cell in planned) continue
-            val r = an.board.cellRects[cell.r][cell.c]
-            val cx = (r.x0 + r.x1) / 2f; val cy = (r.y0 + r.y1) / 2f
-            val rad = (r.x1 - r.x0) * 0.30f
-            c.drawCircle(cx, cy, rad, if (g.letter in rackSet) bgRack else bgGuess)
-            tx.textSize = rad * 1.3f
-            c.drawText(g.letter.toString(), cx, cy + tx.textSize * 0.35f, tx)
-            if (g.p < 0.95) {
-                small.textSize = rad * 0.65f
-                c.drawText("%${(g.p * 100).toInt()}", cx, r.y1 - rad * 0.12f, small)
-            }
-        }
-
-        // Planın önerdiği hamleler.
         for (pl in an.plan.placements) {
             val r = an.board.cellRects[pl.cell.r][pl.cell.c]
             val cx = (r.x0 + r.x1) / 2f; val cy = (r.y0 + r.y1) / 2f
