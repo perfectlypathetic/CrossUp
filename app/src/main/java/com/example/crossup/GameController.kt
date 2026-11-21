@@ -48,14 +48,9 @@ class TurnTracker {
         "son4: sıra ${if (nextIsMine) "BENDE" else "RAKİPTE"} (${idx + 1}/4)"
 }
 
-/** Bir hücre için en olası harf ve olasılığı. */
-class Guess(val letter: Char, val p: Double)
-
 class Analysis(
     val board: ParsedBoard, val rack: List<Char>, val plan: Plan,
     val note: String,
-    /** Her boş hücre için en olası harf (plan PAS olsa bile gösterilir). */
-    val guesses: Map<CellPos, Guess> = emptyMap(),
     val solvedSlots: Int = 0,
     val totalSlots: Int = 0
 )
@@ -73,7 +68,8 @@ class LetterResult(
     val rack: List<Char>,    // okunan raf
     val boardFilled: Int,    // tahtadaki dolu hücre sayısı
     val boardKnown: Int,     // bunlardan harfi bilinenler
-    val unresolved: Int      // tanınamayan karo sayısı (raf + tahta)
+    val unresolved: Int,     // tanınamayan karo sayısı (raf + tahta)
+    val rackMissing: Int     // tanınamayan RAF karosu sayısı
 )
 
 class GameController(apiKey: String, ctx: Context) {
@@ -97,7 +93,7 @@ class GameController(apiKey: String, ctx: Context) {
     private val candCache = ConcurrentHashMap<String, List<Candidate>>()
     /** AI'a bir kez sorulmuş yuvalar. Oyun boyunca tekrar sorulmaz. */
     private val asked: MutableSet<String> = ConcurrentHashMap.newKeySet()
-    /** Son AI hatası (ekranda göstermek için). */
+    /** Son AI hatası (sadece "hata oldu mu" bilgisi için). */
     @Volatile private var lastAiError = ""
 
     private fun slotKey(s: WordSlot) = "${s.dir}${s.clueCell.r},${s.clueCell.c}:${s.length}"
@@ -129,7 +125,8 @@ class GameController(apiKey: String, ctx: Context) {
             rack = reading.rack,
             boardFilled = filled.size,
             boardKnown = filled.count { it in letterCache },
-            unresolved = letters.lastUnresolved
+            unresolved = letters.lastUnresolved,
+            rackMissing = letters.lastUnresolvedRack
         )
     }
 
@@ -166,13 +163,14 @@ class GameController(apiKey: String, ctx: Context) {
     }
 
     /**
-     * ANALİZ: Harf sormaz (sadece kayıtlı şablonlarla okur). Tanınmayan harf varsa "Harfleri tanı" der.
+     * ANALİZ: Harf sormaz (sadece kayıtlı şablonlarla okur).
+     * Sadece RAFTAKİ harfler okunamazsa durur. Tahtadaki tanınmayan hücreler yok sayılır.
      * İpuçları oyun boyunca en fazla bir kez AI'a sorulur.
      */
     suspend fun analyze(bmp: Bitmap, progress: (String) -> Unit = {}): Analysis {
         progress("Izgara aranıyor…")
         val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
-        progress("Izgara ${board.rows}x${board.cols}, ${board.slots.size} yuva. Harfler okunuyor…")
+        progress("Harfler okunuyor…")
 
         syncSignature(board)
         lastAiError = ""
@@ -184,8 +182,8 @@ class GameController(apiKey: String, ctx: Context) {
         for (p in need) reading.letters[p]?.let { letterCache[p] = it }
         for (p in filled) letterCache[p]?.let { st.known[p] = it }
 
-        if (letters.lastUnresolved > 0)
-            error("${letters.lastUnresolved} harf tanınamadı. Önce 'Harfleri tanı' butonuna bas, sonra Analiz.")
+        if (letters.lastUnresolvedRack > 0)
+            error("Raftaki ${letters.lastUnresolvedRack} harf tanınamadı. 'Harfleri tanı' butonuna bas, sonra Analiz.")
         if (reading.rack.isEmpty())
             error("Raftaki harfler okunamadı. 'Harfleri tanı' butonuna bas, sonra Analiz.")
 
@@ -226,26 +224,19 @@ class GameController(apiKey: String, ctx: Context) {
 
         val plan = Planner(st).plan(reading.rack, ctx)
 
-        // Tüm bulmaca: her boş hücre için en olası harf (plan PAS olsa bile gösterilir).
-        val inf = Inference(st)
-        val refined = inf.refine(st.known)
-        val guesses = HashMap<CellPos, Guess>()
-        for (cell in st.emptyCells()) {
-            val top = inf.cellDist(cell, refined).maxByOrNull { it.value } ?: continue
-            guesses[cell] = Guess(top.key, top.value)
-        }
         val solved = board.slots.count { st.emptyIn(it) == 0 || !st.cands[it].isNullOrEmpty() }
 
+        // Ekranda gösterilecek kısa not: sadece işe yarar şeyler.
         val note = buildString {
-            append(turns.label)
-            if (!turns.endgame && st.inEndgame()) append(" — boş hücre ${st.emptyCells().size}, son 4 turu başlat!")
+            if (turns.endgame) append(turns.label)
+            if (!turns.endgame && st.inEndgame()) append("Boş hücre azaldı: 'Son4' butonlarından birine bas.")
             if (turns.endgame && !turns.nextIsMine && !turns.finished) append(" (rakibin hamlesini bekle)")
-            append("\nDB:${dbHits.get()} AI:${aiCalls.get()} (kayıtlı: ${db.size()})")
-            append("\nÇözülen yuva: $solved/${board.slots.size}, tahmin edilen hücre: ${guesses.size}/${st.emptyCells().size}")
-            if (lastAiError.isNotEmpty()) append("\nAI hatası: $lastAiError")
-            if (plan.pass) append("\nPAS: %50 üstü güvenli hamle yok. Turuncu/mavi harfler en olası cevaplar.")
+            if (lastAiError.isNotEmpty()) {
+                if (isNotEmpty()) append("\n")
+                append("Yapay zeka cevap vermedi (kota dolmuş olabilir). Sonuç eksik, biraz sonra tekrar Analiz'e bas.")
+            }
         }
-        return Analysis(board, reading.rack, plan, note, guesses, solved, board.slots.size)
+        return Analysis(board, reading.rack, plan, note, solved, board.slots.size)
     }
 
     /**
