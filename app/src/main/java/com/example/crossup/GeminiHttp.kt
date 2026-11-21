@@ -1,5 +1,5 @@
 package com.example.crossup.ai
- 
+
 import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
@@ -10,7 +10,7 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
- 
+
 /** Görevlere göre model öncelik listeleri. Soldaki en tercih edilen. */
 object Models {
     /** Tahta/raf okuma: doğruluk kritik, tek istek -> en güçlü modeller önce. */
@@ -18,7 +18,7 @@ object Models {
         "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3-flash-preview",
         "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-robotics-er-2-preview"
     )
- 
+
     /** İpucu çözme: çok sayıda paralel istek -> kotayı yaymak için 3.6 ile başla, Gemma en sonda. */
     val SOLVER = listOf(
         "gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.5-flash", "gemini-3-flash-preview",
@@ -26,31 +26,31 @@ object Models {
         "gemini-flash-lite-latest", "gemma-4-31b-it", "gemma-4-26b-a4b-it"
     )
 }
- 
+
 class ApiError(val code: Int, message: String) : Exception(message)
- 
+
 object GeminiHttp {
     private const val TAG = "GeminiHttp"
- 
+
     /** model -> bu zamana (ms) kadar kullanma. */
     private val cooldown = ConcurrentHashMap<String, Long>()
     @Volatile var lastModel: String = ""; private set
- 
+
     private fun now() = System.currentTimeMillis()
     private fun ban(model: String, ms: Long) { cooldown[model] = now() + ms }
- 
+
     /** Soğumada olmayanlar sırayla; hepsi soğumadaysa en erken açılandan başla. */
     private fun order(chain: List<String>): List<String> {
         val ok = chain.filter { (cooldown[it] ?: 0L) <= now() }
         return if (ok.isNotEmpty()) ok else chain.sortedBy { cooldown[it] ?: 0L }
     }
- 
+
     suspend fun askImage(
         apiKey: String, chain: List<String>, image: ByteArray, mime: String,
         prompt: String, maxTokens: Int
     ): String = withContext(Dispatchers.IO) {
         var last = "bilinmiyor"
-        for (model in order(chain).take(4)) {      // en fazla 4 model dene
+        for (model in order(chain).take(2)) {      // en fazla 2 model dene (hız için)
             try {
                 val out = try {
                     call(apiKey, model, image, mime, prompt, maxTokens, plain = model.startsWith("gemma"))
@@ -82,11 +82,11 @@ object GeminiHttp {
         }
         error("Tüm modeller başarısız oldu. Son hata: ${last.take(200)}")
     }
- 
+
     private fun isKeyError(e: ApiError) =
         e.message?.contains("API key", ignoreCase = true) == true ||
         e.message?.contains("API_KEY", ignoreCase = true) == true
- 
+
     private fun call(
         apiKey: String, model: String, image: ByteArray, mime: String,
         prompt: String, maxTokens: Int, plain: Boolean
@@ -103,11 +103,11 @@ object GeminiHttp {
                     .put("data", Base64.encodeToString(image, Base64.NO_WRAP))))
                 .put(JSONObject().put("text", prompt)))))
             .put("generationConfig", gen)
- 
+
         val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"; doOutput = true
-            connectTimeout = 10_000; readTimeout = 25_000
+            connectTimeout = 8_000; readTimeout = 15_000
             setRequestProperty("content-type", "application/json")
             setRequestProperty("x-goog-api-key", apiKey)
         }
@@ -117,7 +117,7 @@ object GeminiHttp {
             val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)
                 ?.bufferedReader()?.readText() ?: ""
             if (code !in 200..299) throw ApiError(code, resp.take(200))
- 
+
             val parts = JSONObject(resp).optJSONArray("candidates")?.optJSONObject(0)
                 ?.optJSONObject("content")?.optJSONArray("parts")
                 ?: throw IllegalStateException("Boş cevap (güvenlik filtresi?)")
@@ -131,4 +131,3 @@ object GeminiHttp {
         } finally { conn.disconnect() }
     }
 }
- 
