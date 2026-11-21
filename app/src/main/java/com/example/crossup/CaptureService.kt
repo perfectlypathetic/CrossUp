@@ -13,9 +13,11 @@ import android.media.projection.MediaProjectionManager
 import android.os.*
 import android.view.*
 import android.widget.*
+import com.example.crossup.ai.TR_ALPHABET
 import com.example.crossup.game.Analysis
 import com.example.crossup.game.GameController
 import kotlinx.coroutines.*
+import kotlin.coroutines.resume
 
 /** Foreground servis: ekranı yakalar, overlay panel + hücre işaretleri gösterir. */
 class CaptureService : Service() {
@@ -157,17 +159,76 @@ class CaptureService : Service() {
         wm.addView(panel, panelLp)
     }
 
+    // ---------- "Bu harf hangisi?" penceresi ----------
+    private suspend fun askLetter(crop: Bitmap, guess: Char?, remaining: Int): Char? =
+        withContext(Dispatchers.Main) {
+            suspendCancellableCoroutine<Char?> { cont ->
+                val dm = resources.displayMetrics
+                val box = LinearLayout(this@CaptureService)
+                var removed = false
+                fun finish(ch: Char?) {
+                    if (!removed) { removed = true; runCatching { wm.removeView(box) } }
+                    if (cont.isActive) cont.resume(ch)
+                }
+
+                box.orientation = LinearLayout.VERTICAL
+                box.setBackgroundColor(0xEE000000.toInt())
+                box.setPadding(16, 16, 16, 16)
+
+                box.addView(TextView(this@CaptureService).apply {
+                    setTextColor(Color.WHITE); textSize = 14f
+                    text = "Bu harf hangisi? (kalan: $remaining)" +
+                        (if (guess != null) "\nTahmin: $guess (yeşil)" else "")
+                })
+                box.addView(ImageView(this@CaptureService).apply {
+                    setImageBitmap(crop)
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                    setBackgroundColor(0xFFDDDDDD.toInt())
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, (dm.heightPixels * 0.12f).toInt()
+                    ).apply { topMargin = 8; bottomMargin = 8 }
+                })
+                for (chunk in TR_ALPHABET.chunked(6)) {
+                    val r = LinearLayout(this@CaptureService).apply { orientation = LinearLayout.HORIZONTAL }
+                    for (c in chunk) {
+                        r.addView(btn(c.toString()) { finish(c) }.also {
+                            it.textSize = 16f
+                            if (c == guess) it.setBackgroundColor(0xFF2E7D32.toInt())
+                        })
+                    }
+                    box.addView(r)
+                }
+                val skipRow = LinearLayout(this@CaptureService).apply { orientation = LinearLayout.HORIZONTAL }
+                skipRow.addView(btn("Atla (bilmiyorum)") { finish(null) })
+                box.addView(skipRow)
+
+                val lp = WindowManager.LayoutParams(
+                    (dm.widthPixels * 0.92f).toInt(), WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                    PixelFormat.TRANSLUCENT
+                ).apply {
+                    gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                    y = (dm.heightPixels * 0.06f).toInt()
+                }
+                wm.addView(box, lp)
+                cont.invokeOnCancellation { box.post { finish(null) } }
+            }
+        }
+
     private fun analyze() {
         if (busy) return
         busy = true; status.text = "Ekran yakalanıyor…"
         scope.launch {
             try {
                 val bmp = capture()
-                val a = withTimeoutOrNull(38_000) {
+                val a = withTimeoutOrNull(300_000) {
                     withContext(Dispatchers.Default) {
-                        controller.analyze(bmp) { msg -> status.post { status.text = msg } }
+                        controller.analyze(bmp, { c, g, n -> askLetter(c, g, n) }) { msg ->
+                            status.post { status.text = msg }
+                        }
                     }
-                } ?: error("Zaman aşımı (38 sn). İnternet/API anahtarı/kota kontrol et.")
+                } ?: error("Zaman aşımı. İnternet/API anahtarı/kota kontrol et.")
                 show(a)
             } catch (e: CancellationException) {
                 throw e
@@ -185,11 +246,13 @@ class CaptureService : Service() {
         scope.launch {
             try {
                 val bmp = capture()
-                val r = withTimeoutOrNull(60_000) {
+                val r = withTimeoutOrNull(300_000) {
                     withContext(Dispatchers.Default) {
-                        controller.learn(bmp) { msg -> status.post { status.text = msg } }
+                        controller.learn(bmp, { c, g, n -> askLetter(c, g, n) }) { msg ->
+                            status.post { status.text = msg }
+                        }
                     }
-                } ?: error("Zaman aşımı (60 sn). İnternet/API anahtarı/kota kontrol et.")
+                } ?: error("Zaman aşımı.")
                 markers.clear()
                 status.text = "Öğrenme bitti.\n" +
                     "Dolu yuva: ${r.fullSlots} → yeni kelime: ${r.added}\n" +
