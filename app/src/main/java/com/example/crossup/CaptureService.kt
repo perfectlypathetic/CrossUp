@@ -44,7 +44,8 @@ class CaptureService : Service() {
         val code = intent?.getIntExtra("code", 0) ?: 0
         val data: Intent? = intent?.getParcelableExtra("data")
         val key = intent?.getStringExtra("key") ?: ""
-        if (data == null || key.isBlank()) { stopSelf(); return START_NOT_STICKY }
+        // API anahtarı artık zorunlu değil (yapay zeka kapalı).
+        if (data == null) { stopSelf(); return START_NOT_STICKY }
 
         startForeground(1, notification())          // Android 14: önce foreground, sonra projection
         val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
