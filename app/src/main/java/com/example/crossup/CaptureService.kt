@@ -30,6 +30,7 @@ class CaptureService : Service() {
 
     private lateinit var controller: GameController
     private lateinit var panel: LinearLayout
+    private lateinit var panelLp: WindowManager.LayoutParams
     private lateinit var status: TextView
     private lateinit var markers: MarkerView
     private var busy = false
@@ -92,7 +93,10 @@ class CaptureService : Service() {
     }
 
     private fun btn(t: String, onClick: () -> Unit) = Button(this).apply {
-        text = t; textSize = 11f; isAllCaps = false; setOnClickListener { onClick() }
+        text = t; textSize = 10f; isAllCaps = false; minWidth = 0; minimumWidth = 0
+        setPadding(8, 0, 8, 0)
+        layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        setOnClickListener { onClick() }
     }
 
     private fun setupOverlay() {
@@ -112,25 +116,59 @@ class CaptureService : Service() {
             addView(btn("Sıradaki ▶") { controller.turns.advance(); status.text = controller.turns.label })
             addView(btn("✕") { stopSelf() })
         }
-        panel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; setBackgroundColor(0xCC000000.toInt()); setPadding(16, 8, 16, 8)
-            addView(status); addView(row)
-        }
-        wm.addView(panel, WindowManager.LayoutParams(-1, -2, type,
+
+        val dm = resources.displayMetrics
+        panelLp = WindowManager.LayoutParams(
+            (dm.widthPixels * 0.92f).toInt(), WindowManager.LayoutParams.WRAP_CONTENT, type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT).apply { gravity = Gravity.BOTTOM })
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = (dm.widthPixels * 0.04f).toInt(); y = (dm.heightPixels * 0.65f).toInt()
+        }
+
+        // Sürükleme tutamacı: buradan tutup paneli istediğin yere taşı.
+        val handle = TextView(this).apply {
+            text = "⠿ sürükle ⠿"; setTextColor(0xFFBBBBBB.toInt()); textSize = 12f
+            gravity = Gravity.CENTER; setPadding(0, 10, 0, 14)
+            var sx = 0; var sy = 0; var ox = 0f; var oy = 0f
+            setOnTouchListener { _, e ->
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> { sx = panelLp.x; sy = panelLp.y; ox = e.rawX; oy = e.rawY }
+                    MotionEvent.ACTION_MOVE -> {
+                        panelLp.x = (sx + (e.rawX - ox).toInt()).coerceIn(0, dm.widthPixels - panelLp.width)
+                        panelLp.y = (sy + (e.rawY - oy).toInt()).coerceIn(0, dm.heightPixels - 100)
+                        wm.updateViewLayout(panel, panelLp)
+                    }
+                }
+                true
+            }
+        }
+
+        panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setBackgroundColor(0xCC000000.toInt()); setPadding(16, 0, 16, 8)
+            addView(handle); addView(status); addView(row)
+        }
+        wm.addView(panel, panelLp)
     }
 
     private fun analyze() {
         if (busy) return
-        busy = true; status.text = "Analiz ediliyor…"
+        busy = true; status.text = "Ekran yakalanıyor…"
         scope.launch {
             try {
                 val bmp = capture()
-                val a = withContext(Dispatchers.Default) { controller.analyze(bmp) }
+                val a = withTimeoutOrNull(90_000) {
+                    withContext(Dispatchers.Default) {
+                        controller.analyze(bmp) { msg -> status.post { status.text = msg } }
+                    }
+                } ?: error("Zaman aşımı (90 sn). İnternet/API anahtarı/kota kontrol et.")
                 show(a)
-            } catch (e: Exception) {
-                status.text = "Hata: ${e.message}"
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                android.util.Log.e("CrossUp", "analyze", e)
+                status.text = "Hata: ${e.message ?: e.javaClass.simpleName}"
             } finally { busy = false }
         }
     }
