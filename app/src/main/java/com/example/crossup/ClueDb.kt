@@ -40,8 +40,9 @@ class ClueDb private constructor(ctx: Context) {
         if (!ok && bak.exists()) runCatching { map.putAll(parse(bak.readText())) }
     }
 
-    private fun parse(text: String): HashMap<String, MutableSet<String>> {
-        val o = JSONObject(text)
+    private fun parse(text: String): HashMap<String, MutableSet<String>> = parseObj(JSONObject(text))
+
+    private fun parseObj(o: JSONObject): HashMap<String, MutableSet<String>> {
         val r = HashMap<String, MutableSet<String>>()
         for (k in o.keys()) {
             val a = o.getJSONArray(k)
@@ -85,17 +86,14 @@ class ClueDb private constructor(ctx: Context) {
     @Synchronized
     fun size(): Int = map.values.sumOf { it.size }
 
-    /** Yedek almak için tüm veriyi yazar. */
+    /** Bulut eşitleme için tüm veriyi JSON olarak verir. */
     @Synchronized
-    fun exportTo(out: OutputStream) {
-        out.write(toJson().toByteArray(Charsets.UTF_8))
-        out.flush()
-    }
+    fun snapshot(): JSONObject = JSONObject(toJson())
 
-    /** Yedekten birleştirerek yükler (var olanı silmez). Yeni eklenen kelime sayısını döner. */
+    /** JSON'daki kelimeleri birleştirerek ekler (var olanı silmez). Yeni eklenen kelime sayısını döner. */
     @Synchronized
-    fun importFrom(inp: InputStream): Int {
-        val imported = parse(inp.readBytes().toString(Charsets.UTF_8))
+    fun mergeJson(o: JSONObject): Int {
+        val imported = parseObj(o)
         var added = 0
         for ((k, words) in imported) {
             val near = map.keys.minByOrNull { dist(it, k) }
@@ -106,6 +104,18 @@ class ClueDb private constructor(ctx: Context) {
         if (added > 0) save()
         return added
     }
+
+    /** Yedek almak için tüm veriyi yazar. */
+    @Synchronized
+    fun exportTo(out: OutputStream) {
+        out.write(toJson().toByteArray(Charsets.UTF_8))
+        out.flush()
+    }
+
+    /** Yedekten birleştirerek yükler (var olanı silmez). Yeni eklenen kelime sayısını döner. */
+    @Synchronized
+    fun importFrom(inp: InputStream): Int =
+        mergeJson(JSONObject(inp.readBytes().toString(Charsets.UTF_8)))
 
     private fun toJson(): String {
         val o = JSONObject()
