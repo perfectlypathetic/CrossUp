@@ -287,7 +287,8 @@ class CaptureService : Service() {
                 markers.clear()
                 status.text = "Raf: ${r.rack.joinToString("")}\n" +
                     (if (r.rackMissing > 0) "Raftaki ${r.rackMissing} harf tanınmadı (tekrar bas)."
-                    else "Raf tamam. Analiz'e basabilirsin.")
+                    else "Raf tamam. Analiz'e basabilirsin.") +
+                    (if (r.info.isNotEmpty()) "\n[${r.info}]" else "")
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
