@@ -51,7 +51,7 @@ class CaptureService : Service() {
             }, Handler(Looper.getMainLooper()))
         }
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        controller = GameController(key)
+        controller = GameController(key, applicationContext)
         setupCapture(); setupOverlay()
         return START_NOT_STICKY
     }
@@ -158,11 +158,11 @@ class CaptureService : Service() {
         scope.launch {
             try {
                 val bmp = capture()
-                val a = withTimeoutOrNull(90_000) {
+                val a = withTimeoutOrNull(38_000) {
                     withContext(Dispatchers.Default) {
                         controller.analyze(bmp) { msg -> status.post { status.text = msg } }
                     }
-                } ?: error("Zaman aşımı (90 sn). İnternet/API anahtarı/kota kontrol et.")
+                } ?: error("Zaman aşımı (38 sn). İnternet/API anahtarı/kota kontrol et.")
                 show(a)
             } catch (e: CancellationException) {
                 throw e
