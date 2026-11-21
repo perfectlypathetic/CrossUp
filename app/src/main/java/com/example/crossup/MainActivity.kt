@@ -24,6 +24,7 @@ class MainActivity : Activity() {
         const val REQ_IMPORT = 102
         const val REQ_CLOUD_NEW = 103
         const val REQ_CLOUD_PICK = 104
+        const val REQ_TDK = 105
     }
 
     override fun onCreate(s: Bundle?) {
@@ -75,6 +76,18 @@ class MainActivity : Activity() {
             setOnClickListener { CloudSync.disconnect(this@MainActivity); refreshInfo() }
         }
 
+        val tdkPick = Button(this).apply {
+            text = "TDK sözlüğünü dosyadan yükle (tdk.txt)"
+            setOnClickListener {
+                startActivityForResult(
+                    Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "*/*"
+                    }, REQ_TDK
+                )
+            }
+        }
+
         val export = Button(this).apply {
             text = "Verileri dışa aktar (elle yedek)"
             setOnClickListener {
@@ -103,6 +116,7 @@ class MainActivity : Activity() {
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40)
                 addView(keyBox); addView(go); addView(info)
+                addView(tdkPick)
                 addView(cloudNew); addView(cloudPick); addView(cloudOff)
                 addView(export); addView(import)
             })
@@ -163,6 +177,20 @@ class MainActivity : Activity() {
                 Toast.makeText(this, "Eşitleniyor…", Toast.LENGTH_SHORT).show()
                 Thread {
                     val msg = CloudSync.sync(applicationContext)
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
+                        refreshInfo()
+                    }
+                }.start()
+            }
+            REQ_TDK -> {
+                val uri = data.data ?: return
+                Toast.makeText(this, "Sözlük yükleniyor…", Toast.LENGTH_SHORT).show()
+                Thread {
+                    val ok = try {
+                        contentResolver.openInputStream(uri)!!.use { TdkDb.get(this@MainActivity).installFrom(it) }
+                    } catch (e: Exception) { false }
+                    val msg = if (ok) "TDK sözlüğü yüklendi." else "TDK yüklenemedi: " + TdkDb.get(this@MainActivity).lastError
                     runOnUiThread {
                         Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
                         refreshInfo()
