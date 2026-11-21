@@ -130,4 +130,181 @@ class GameController(apiKey: String, ctx: Context) {
     }
 
     /**
-     * ÖĞREN: Analiz yapmaz, plan çıkarmaz, ipucu çözdürmez, rafı
+     * ÖĞREN: Analiz yapmaz, plan çıkarmaz, ipucu çözdürmez, rafı okumaz.
+     * Sadece tahtadaki harfleri okur ve tamamen dolu yuvaları veritabanına kaydeder.
+     */
+    suspend fun learn(bmp: Bitmap, ask: AskLetter?, progress: (String) -> Unit = {}): LearnResult {
+        progress("Izgara aranıyor…")
+        val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
+        syncSignature(board)
+
+        val filled = board.cellsOf(CellKind.FILLED)
+        val need = filled.filter { it !in letterCache }
+        progress("Harfler okunuyor…")
+        val reading = letters.read(bmp, board, need, ask, includeRack = false)
+        for (p in need) reading.letters[p]?.let { letterCache[p] = it }
+
+        val known = HashMap<CellPos, Char>()
+        for (p in filled) letterCache[p]?.let { known[p] = it }
+
+        progress("Veritabanına kaydediliyor…")
+        val before = db.size()
+        var full = 0
+        for (s in board.slots) {
+            if (s.cells.all { it in known }) {
+                full++
+                db.put(db.key(bmp.crop(s.clueRect)), s.cells.map { known[it]!! }.joinToString(""))
+            }
+        }
+        val after = db.size()
+        val unread = filled.count { it !in known }
+        return LearnResult(full, after - before, unread, after)
+    }
+
+    /**
+     * ANALİZ: Harf sormaz (sadece kayıtlı şablonlarla okur).
+     * Sadece RAFTAKİ harfler okunamazsa durur. Tahtadaki tanınmayan hücreler yok sayılır.
+     * İpuçları: önce bellek, telefondaki veritabanı ve TDK sözlüğü; kalanlar TEK TOPLU istekle AI'a sorulur.
+     */
+    suspend fun analyze(bmp: Bitmap, progress: (String) -> Unit = {}): Analysis {
+        progress("Izgara aranıyor…")
+        val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
+        progress("Harfler okunuyor…")
+
+        syncSignature(board)
+        lastAiError = ""
+        tdkHits = 0
+
+        val st = GameState(board)
+        val filled = board.cellsOf(CellKind.FILLED)
+        val need = filled.filter { it !in letterCache }
+        val reading = letters.read(bmp, board, need, null, includeRack = true)   // null: kullanıcıya sorma
+        for (p in need) reading.letters[p]?.let { letterCache[p] = it }
+        for (p in filled) letterCache[p]?.let { st.known[p] = it }
+
+        if (letters.lastUnresolvedRack > 0)
+            error("Raftaki ${letters.lastUnresolvedRack} harf tanınamadı. 'Harfleri tanı' butonuna bas, sonra Analiz.")
+        if (reading.rack.isEmpty())
+            error("Raftaki harfler okunamadı. 'Harfleri tanı' butonuna bas, sonra Analiz.")
+
+        val deadline = System.currentTimeMillis() + AI_TIME_LIMIT_MS
+
+        // ÖĞRENME: tamamen dolmuş yuvaların ipucu görüntüsünü ve cevabını telefona kaydet.
+        for (s in board.slots) {
+            if (s.cells.all { it in st.known }) {
+                db.put(db.key(bmp.crop(s.clueRect)), s.cells.map { st.known[it]!! }.joinToString(""))
+            }
+        }
+
+        // İpucu çözümü: sadece henüz bitmemiş yuvalar.
+        val todo = board.slots.filter { st.emptyIn(it) > 0 }.sortedBy { st.emptyIn(it) }
+        progress("Raf: ${reading.rack.joinToString("")} — ${todo.size} ipucu kontrol ediliyor")
+
+        // TDK sözlüğünü yükle (ilk seferde kısa sürer, sonra anında).
+        if (!tdk.ready) {
+            progress("TDK sözlüğü yükleniyor…")
+            tdk.prepare()
+        }
+
+        // 1. aşama: bellek + telefondaki veritabanı + TDK (kotasız).
+        val results = HashMap<WordSlot, List<Candidate>>()
+        val pending = ArrayList<Pending>()
+        for (s in todo) {
+            val key = slotKey(s)
+            val pattern = s.cells.map { st.known[it] ?: '?' }.joinToString("")
+            val crop = bmp.crop(s.clueRect)
+            val local = localCands(s, key, pattern, crop)
+            if (local != null) results[s] = local else pending.add(Pending(s, key, pattern, crop))
+        }
+        if (tdkHits > 0) progress("TDK ile $tdkHits ipucu çözüldü, ${pending.size} ipucu kaldı")
+
+        // 2. aşama: kalanlar tek toplu AI isteğiyle (SON ÇARE).
+        if (pending.isNotEmpty()) {
+            if (deadline - System.currentTimeMillis() < 3000) {
+                lastAiError = "süre doldu"
+                for (p in pending) results[p.slot] = emptyList()
+            } else {
+                progress("Yapay zekaya ${pending.size} ipucu toplu soruluyor…")
+                val answers = solver.solveBatch(
+                    pending.map { ClueQuery(it.crop.toPng(), it.slot.length, it.pattern) }, deadline
+                )
+                var missing = 0
+                pending.forEachIndexed { i, p ->
+                    val a = answers.getOrNull(i)
+                    if (a != null) {
+                        candCache[p.key] = a
+                        asked.add(p.key)        // cevap geldi: bu oyunda bir daha sorulmaz
+                        results[p.slot] = a
+                    } else {
+                        missing++               // asked'e eklenmez, sonraki analizde yeniden denenir
+                        results[p.slot] = emptyList()
+                    }
+                }
+                if (missing > 0) lastAiError = solver.lastError.ifEmpty { "bazı ipuçları için cevap gelmedi" }
+            }
+        }
+        for ((s, c) in results) st.cands[s] = c
+
+        progress("Hamle planlanıyor…")
+        val ctx = if (turns.endgame)
+            TurnContext(true, turns.myTurnsLeft.coerceAtLeast(1), turns.oppAfterNextMine)
+        else Phase.context(st, 99, 1).let { TurnContext(false, it.myMovesLeft, it.opponentMovesAfterMe) }
+
+        val plan = Planner(st).plan(reading.rack, ctx)
+
+        val solved = board.slots.count { st.emptyIn(it) == 0 || !st.cands[it].isNullOrEmpty() }
+
+        // Ekranda gösterilecek kısa not: sadece işe yarar şeyler.
+        val note = buildString {
+            if (turns.endgame) append(turns.label)
+            if (!turns.endgame && st.inEndgame()) append("Boş hücre azaldı: 'Son4' butonlarından birine bas.")
+            if (turns.endgame && !turns.nextIsMine && !turns.finished) append(" (rakibin hamlesini bekle)")
+            if (tdkHits > 0) {
+                if (isNotEmpty()) append("\n")
+                append("TDK ile çözülen: $tdkHits ipucu")
+            }
+            if (lastAiError.isNotEmpty()) {
+                if (isNotEmpty()) append("\n")
+                append("Yapay zeka cevap vermedi (kota dolmuş olabilir). Sonuç eksik, biraz sonra tekrar Analiz'e bas.")
+            }
+        }
+        return Analysis(board, reading.rack, plan, note, solved, board.slots.size)
+    }
+
+    /**
+     * AI'sız çözüm: 1) bellek  2) telefondaki veritabanı  3) TDK sözlüğü.
+     * Liste dönerse yuva çözülmüştür (boş olabilir). null dönerse AI'a sorulmalıdır.
+     */
+    private suspend fun localCands(s: WordSlot, key: String, pattern: String, crop: Bitmap): List<Candidate>? {
+        fun fits(w: String) = w.indices.all { pattern[it] == '?' || pattern[it] == w[it] }
+
+        // 1) Bellek: kayıtlı adaylar, tahtadaki yeni harflere göre elenir.
+        candCache[key]?.let { c ->
+            val f = c.filter { fits(it.word) }
+            if (f.isNotEmpty() || key in asked) return f   // AI zaten sorulduysa bir daha sorma
+        }
+
+        // 2) Telefondaki veritabanı
+        val hit = db.get(db.key(crop), s.length).filter { fits(it) }
+        if (hit.isNotEmpty()) return hit.map { Candidate(it, 1.0) }.also { candCache[key] = it }
+
+        // 3) TDK sözlüğü: ipucu yazısı bir kez okunur (OCR), her seferinde güncel desenle aranır.
+        //    Güven düşükse / resimli ipucuysa null döner ve Gemini'ye geçilir.
+        if (tdk.ready && key !in asked) {
+            var text = ocrCache[key]
+            if (text == null) {
+                text = tdk.readClue(crop)
+                ocrCache[key] = text
+            }
+            val t = tdk.candidates(text, s.length, pattern)
+            if (t != null) {
+                tdkHits++
+                return t
+            }
+        }
+
+        // 4) AI zaten sorulduysa tekrar sorma.
+        if (key in asked) return emptyList()
+        return null
+    }
+}
