@@ -10,7 +10,8 @@ import kotlin.math.roundToInt
  *     SAĞ kenar: köşede resimli ipucu varsa yeşil görünmez; bu yüzden ızgara ekranda
  *     ortalı kabul edilir (sağ kenar = ekran genişliği - sol kenar).
  *  2. Hücre türü: kenar halkasının rengine göre yeşil -> CLUE, beyaz -> EMPTY, diğer -> FILLED.
- *  2b. Resimli ipucu hücreleri (ok + karışık renkli halka) CLUE yapılır.
+ *  2a. İlk satır ve ilk sütun HER ZAMAN ipucu hücresidir (resimli olsalar bile).
+ *  2b. Ortadaki resimli ipucu hücreleri: yanında ok (üçgen) varsa CLUE yapılır.
  *  3. Ok algılama, bölünmüş hücreler ve kelime yuvaları önceki sürümle aynı.
  */
 
@@ -116,15 +117,30 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
         // 3) Hücre türleri.
         val kinds = List(rows) { r -> MutableList(cfg.cols) { c -> classify(src, rects[r][c]) } }
 
-        // 3b) Kenara kadar taşan resimli ipucu hücrelerini (FILLED sanılanları) CLUE yap.
+        // 3a) İlk satır ve ilk sütun her zaman ipucu hücresidir (resimli olsalar bile).
+        for (r in 0 until rows) for (c in 0 until cfg.cols) {
+            if (r == 0 || c == 0) kinds[r][c] = CellKind.CLUE
+        }
+
+        // 3b) Ortadaki resimli ipucu hücrelerini (FILLED sanılanları) CLUE yap.
+        //     Ölçüt: yanında/altında boyutu uygun bir ok üçgeni var, ok açık bir hücreye bakıyor,
+        //     ve (üçgen gibi sivriliyor VEYA kenar halkası resimli).
         for (r in 0 until rows) for (c in 0 until cfg.cols) {
             if (kinds[r][c] != CellKind.FILLED) continue
             val rc = rects[r][c]
             val h = rc.y1 - rc.y0
             val w = rc.x1 - rc.x0
-            val hasRight = c + 1 < cfg.cols && isArrowSize(rightArrowRows(src, rc), h)
-            val hasDown = r + 1 < rows && isArrowSize(downArrowCols(src, rc), w)
-            if ((hasRight || hasDown) && ringIsBusy(src, rc)) kinds[r][c] = CellKind.CLUE
+            val busy = ringIsBusy(src, rc)
+
+            val rightOpen = c + 1 < cfg.cols && kinds[r][c + 1] != CellKind.CLUE
+            val downOpen = r + 1 < rows && kinds[r + 1][c] != CellKind.CLUE
+
+            val hasRight = rightOpen && isArrowSize(rightArrowRows(src, rc), h) &&
+                (busy || rightArrowTapers(src, rc))
+            val hasDown = downOpen && isArrowSize(downArrowCols(src, rc), w) &&
+                (busy || downArrowTapers(src, rc))
+
+            if (hasRight || hasDown) kinds[r][c] = CellKind.CLUE
         }
 
         // 4) Oklar ve kelime yuvaları.
@@ -257,6 +273,35 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
             for (y in rc.y1 + 2..rc.y1 + 15) if (isDark(src.rgb(x, y))) { count++; break }
         }
         return count
+    }
+
+    /**
+     * Sağdaki koyu şekil üçgen gibi sivriliyor mu? Tabanı (kenara yakın) geniş, ucu (uzak) dar olmalı.
+     * Karo çerçevesi veya komşu resim ise her iki yerde de aynı genişlikte koyu olur.
+     */
+    private fun rightArrowTapers(src: PixelSource, rc: Rect): Boolean {
+        var base = 0; var far = 0
+        for (y in rc.y0 + 8 until rc.y1 - 8) {
+            var b = false; var f = false
+            for (x in rc.x1 + 2..rc.x1 + 4) if (isDark(src.rgb(x, y))) { b = true; break }
+            for (x in rc.x1 + 11..rc.x1 + 15) if (isDark(src.rgb(x, y))) { f = true; break }
+            if (b) base++
+            if (f) far++
+        }
+        return base >= 6 && far * 2 <= base
+    }
+
+    /** Alttaki koyu şekil üçgen gibi sivriliyor mu? (rightArrowTapers'ın dikey hali) */
+    private fun downArrowTapers(src: PixelSource, rc: Rect): Boolean {
+        var base = 0; var far = 0
+        for (x in rc.x0 + 8 until rc.x1 - 8) {
+            var b = false; var f = false
+            for (y in rc.y1 + 2..rc.y1 + 4) if (isDark(src.rgb(x, y))) { b = true; break }
+            for (y in rc.y1 + 11..rc.y1 + 15) if (isDark(src.rgb(x, y))) { f = true; break }
+            if (b) base++
+            if (f) far++
+        }
+        return base >= 6 && far * 2 <= base
     }
 
     /** Üçgen boyutunda mı? Çok küçük (gürültü) veya çok büyük (karo çerçevesi/yazı) olmamalı. */
