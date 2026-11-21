@@ -77,6 +77,12 @@ class GameController(apiKey: String, ctx: Context) {
          * Tekrar açmak istersen true yap.
          */
         const val USE_AI = false
+
+        /**
+         * TDK teşhisi. true = analiz notunda her ipucu için OCR'ın okuduğu yazı ve
+         * sözlüğün neden çözdüğü / çözemediği görünür. Sorun çözülünce false yap.
+         */
+        const val DEBUG_TDK = true
     }
 
     private val parser = GridParser()
@@ -97,6 +103,8 @@ class GameController(apiKey: String, ctx: Context) {
     @Volatile private var lastAiError = ""
     /** Bu analizde TDK ile çözülen ipucu sayısı. */
     private var tdkHits = 0
+    /** Teşhis satırları (DEBUG_TDK açıkken). */
+    private val tdkDebug = ArrayList<String>()
 
     /** AI'a sorulması gereken yuva. */
     private class Pending(val slot: WordSlot, val key: String, val pattern: String, val crop: Bitmap)
@@ -181,6 +189,7 @@ class GameController(apiKey: String, ctx: Context) {
         syncSignature(board)
         lastAiError = ""
         tdkHits = 0
+        tdkDebug.clear()
         var unsolvedNoAi = 0
 
         val st = GameState(board)
@@ -282,6 +291,12 @@ class GameController(apiKey: String, ctx: Context) {
                 if (isNotEmpty()) append("\n")
                 append("Yapay zeka cevap vermedi (kota dolmuş olabilir). Sonuç eksik, biraz sonra tekrar Analiz'e bas.")
             }
+            if (DEBUG_TDK) {
+                if (isNotEmpty()) append("\n")
+                append("[TDK teşhis] sözlük: ${if (tdk.ready) "yüklü" else "YÜKLÜ DEĞİL"}")
+                for (line in tdkDebug.take(8)) append("\n").append(line)
+                if (tdkDebug.size > 8) append("\n… +${tdkDebug.size - 8} ipucu daha")
+            }
         }
         return Analysis(board, reading.rack, plan, note, solved, board.slots.size)
     }
@@ -301,7 +316,10 @@ class GameController(apiKey: String, ctx: Context) {
 
         // 2) Telefondaki veritabanı
         val hit = db.get(db.key(crop), s.length).filter { fits(it) }
-        if (hit.isNotEmpty()) return hit.map { Candidate(it, 1.0) }.also { candCache[key] = it }
+        if (hit.isNotEmpty()) {
+            if (DEBUG_TDK) tdkDebug.add("${s.length}h → kayıtlı veritabanından: ${hit.take(3).joinToString(",")}")
+            return hit.map { Candidate(it, 1.0) }.also { candCache[key] = it }
+        }
 
         // 3) TDK sözlüğü: ipucu yazısı bir kez okunur (OCR), her seferinde güncel desenle aranır.
         //    Güven düşükse / resimli ipucuysa null döner.
@@ -312,10 +330,13 @@ class GameController(apiKey: String, ctx: Context) {
                 ocrCache[key] = text
             }
             val t = tdk.candidates(text, s.length, pattern)
+            if (DEBUG_TDK) tdkDebug.add("${s.length}h \"${text.take(40)}\" → ${tdk.lastReason}")
             if (t != null) {
                 tdkHits++
                 return t
             }
+        } else if (DEBUG_TDK && !tdk.ready) {
+            tdkDebug.add("${s.length}h → sözlük yüklü değil")
         }
 
         // 4) AI zaten sorulduysa tekrar sorma.
