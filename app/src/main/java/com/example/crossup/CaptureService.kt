@@ -13,6 +13,7 @@ import android.media.projection.MediaProjectionManager
 import android.os.*
 import android.view.*
 import android.widget.*
+import com.example.crossup.ai.CloudSync
 import com.example.crossup.ai.TR_ALPHABET
 import com.example.crossup.game.Analysis
 import com.example.crossup.game.GameController
@@ -86,6 +87,13 @@ class CaptureService : Service() {
         val full = Bitmap.createBitmap(width + rowPad / p.pixelStride, height, Bitmap.Config.ARGB_8888)
         p.buffer.rewind(); full.copyPixelsFromBuffer(p.buffer)
         return Bitmap.createBitmap(full, 0, 0, width, height)
+    }
+
+    /** Bulut bağlıysa verileri arka planda eşitler (sessiz). */
+    private fun cloudPush() {
+        if (CloudSync.uri(applicationContext) == null) return
+        val app = applicationContext
+        Thread { CloudSync.sync(app) }.start()
     }
 
     // ---------- overlay ----------
@@ -235,7 +243,7 @@ class CaptureService : Service() {
             } catch (e: Throwable) {
                 android.util.Log.e("CrossUp", "analyze", e)
                 status.text = "Hata: ${e.message ?: e.javaClass.simpleName}"
-            } finally { busy = false }
+            } finally { busy = false; cloudPush() }
         }
     }
 
@@ -263,7 +271,7 @@ class CaptureService : Service() {
             } catch (e: Throwable) {
                 android.util.Log.e("CrossUp", "learn", e)
                 status.text = "Hata: ${e.message ?: e.javaClass.simpleName}"
-            } finally { busy = false }
+            } finally { busy = false; cloudPush() }
         }
     }
 
