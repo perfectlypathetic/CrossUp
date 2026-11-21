@@ -2,11 +2,11 @@ package com.example.crossup.game
 
 import android.content.Context
 import android.graphics.Bitmap
+import com.example.crossup.ai.AskLetter
 import com.example.crossup.ai.ClueDb
-import com.example.crossup.ai.GeminiBoardReader
 import com.example.crossup.ai.GeminiClueSolver
+import com.example.crossup.ai.LetterReader
 import com.example.crossup.parser.*
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -60,13 +60,11 @@ class GameController(apiKey: String, ctx: Context) {
         const val MAX_AI_PER_ANALYSIS = 12
         /** Üst üste bu kadar AI hatasında o analizde AI'a sormayı bırak. */
         const val MAX_AI_FAILS = 2
-        /** Öğrenme modunda tek istekte okunacak en fazla hücre sayısı. */
-        const val LEARN_CHUNK = 20
     }
 
     private val parser = GridParser()
     private val solver = GeminiClueSolver(apiKey)
-    private val reader = GeminiBoardReader(apiKey)
+    private val letters = LetterReader(ctx)
     private val db = ClueDb.get(ctx)
     val turns = TurnTracker()
 
@@ -85,32 +83,19 @@ class GameController(apiKey: String, ctx: Context) {
     }
 
     /**
-     * ÖĞREN: Analiz yapmaz, plan çıkarmaz, ipucu çözdürmez.
+     * ÖĞREN: Analiz yapmaz, plan çıkarmaz, ipucu çözdürmez, rafı okumaz.
      * Sadece tahtadaki harfleri okur ve tamamen dolu yuvaları veritabanına kaydeder.
      */
-    suspend fun learn(bmp: Bitmap, progress: (String) -> Unit = {}): LearnResult {
+    suspend fun learn(bmp: Bitmap, ask: AskLetter?, progress: (String) -> Unit = {}): LearnResult {
         progress("Izgara aranıyor…")
         val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
         syncSignature(board)
 
         val filled = board.cellsOf(CellKind.FILLED)
         val need = filled.filter { it !in letterCache }
-        val chunks = need.chunked(LEARN_CHUNK)
-        val jpeg = if (chunks.isNotEmpty()) bmp.toJpeg() else ByteArray(0)
-
-        var failures = 0
-        for ((i, chunk) in chunks.withIndex()) {
-            progress("Harfler okunuyor ${i + 1}/${chunks.size}…")
-            try {
-                val reading = reader.read(jpeg, board, chunk)
-                for (p in chunk) reading.letters[p]?.let { letterCache[p] = it }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                failures++
-            }
-        }
-        if (failures > 0 && failures == chunks.size) error("Harfler okunamadı (internet/API anahtarı/kota?)")
+        progress("Harfler okunuyor…")
+        val reading = letters.read(bmp, board, need, ask, includeRack = false)
+        for (p in need) reading.letters[p]?.let { letterCache[p] = it }
 
         val known = HashMap<CellPos, Char>()
         for (p in filled) letterCache[p]?.let { known[p] = it }
@@ -129,10 +114,7 @@ class GameController(apiKey: String, ctx: Context) {
         return LearnResult(full, after - before, unread, after)
     }
 
-    suspend fun analyze(bmp: Bitmap, progress: (String) -> Unit = {}): Analysis {
-        // Yapay zekaya ayrılan toplam süre sınırı (ms). Bu süreden sonra yeni ipucu sorulmaz.
-        val deadline = System.currentTimeMillis() + 30_000
-
+    suspend fun analyze(bmp: Bitmap, ask: AskLetter?, progress: (String) -> Unit = {}): Analysis {
         progress("Izgara aranıyor…")
         val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
         progress("Izgara ${board.rows}x${board.cols}, ${board.slots.size} yuva. Harfler okunuyor…")
@@ -142,15 +124,13 @@ class GameController(apiKey: String, ctx: Context) {
         val st = GameState(board)
         val filled = board.cellsOf(CellKind.FILLED)
         val need = filled.filter { it !in letterCache }
-        val jpeg = bmp.toJpeg()
-        var reading = reader.read(jpeg, board, need)
-        if (reading.rack.isEmpty()) {
-            progress("Raf okunamadı, tekrar deneniyor…")
-            reading = reader.read(jpeg, board, need)
-        }
+        val reading = letters.read(bmp, board, need, ask, includeRack = true)
         for (p in need) reading.letters[p]?.let { letterCache[p] = it }
         for (p in filled) letterCache[p]?.let { st.known[p] = it }
-        if (reading.rack.isEmpty()) error("Raftaki harfler okunamadı")
+        if (reading.rack.isEmpty()) error("Raftaki harfler okunamadı (raf bulunamadı veya harfler atlandı)")
+
+        // Yapay zekaya ayrılan süre sınırı: harf okuma (kullanıcı cevabı dahil) bittikten sonra başlar.
+        val deadline = System.currentTimeMillis() + 30_000
 
         // ÖĞRENME: tamamen dolmuş yuvaların ipucu görüntüsünü ve cevabını telefona kaydet.
         for (s in board.slots) {
