@@ -48,9 +48,16 @@ class TurnTracker {
         "son4: sıra ${if (nextIsMine) "BENDE" else "RAKİPTE"} (${idx + 1}/4)"
 }
 
+/** Bir hücre için en olası harf ve olasılığı. */
+class Guess(val letter: Char, val p: Double)
+
 class Analysis(
     val board: ParsedBoard, val rack: List<Char>, val plan: Plan,
-    val note: String
+    val note: String,
+    /** Her boş hücre için en olası harf (plan PAS olsa bile gösterilir). */
+    val guesses: Map<CellPos, Guess> = emptyMap(),
+    val solvedSlots: Int = 0,
+    val totalSlots: Int = 0
 )
 
 /** "Öğren" butonunun sonucu. */
@@ -72,9 +79,11 @@ class LetterResult(
 class GameController(apiKey: String, ctx: Context) {
     companion object {
         /** Üst üste bu kadar AI hatasında o analizde AI'a sormayı bırak (kota/ağ sorunu). */
-        const val MAX_AI_FAILS = 3
+        const val MAX_AI_FAILS = 5
         /** Bir analizde AI ile ipucu çözmeye ayrılan toplam süre. */
         const val AI_TIME_LIMIT_MS = 120_000L
+        /** Aynı anda en fazla bu kadar AI isteği (kota hatasını önlemek için düşük tutulur). */
+        const val AI_PARALLEL = 4
     }
 
     private val parser = GridParser()
@@ -88,6 +97,8 @@ class GameController(apiKey: String, ctx: Context) {
     private val candCache = ConcurrentHashMap<String, List<Candidate>>()
     /** AI'a bir kez sorulmuş yuvalar. Oyun boyunca tekrar sorulmaz. */
     private val asked: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    /** Son AI hatası (ekranda göstermek için). */
+    @Volatile private var lastAiError = ""
 
     private fun slotKey(s: WordSlot) = "${s.dir}${s.clueCell.r},${s.clueCell.c}:${s.length}"
 
@@ -164,6 +175,7 @@ class GameController(apiKey: String, ctx: Context) {
         progress("Izgara ${board.rows}x${board.cols}, ${board.slots.size} yuva. Harfler okunuyor…")
 
         syncSignature(board)
+        lastAiError = ""
 
         val st = GameState(board)
         val filled = board.cellsOf(CellKind.FILLED)
@@ -193,7 +205,7 @@ class GameController(apiKey: String, ctx: Context) {
         val aiCalls = AtomicInteger(0)
         val aiFails = AtomicInteger(0)
         progress("Raf: ${reading.rack.joinToString("")} — ipuçları çözülüyor 0/${todo.size}")
-        val sem = Semaphore(8)
+        val sem = Semaphore(AI_PARALLEL)
         val results = coroutineScope {
             todo.map { s ->
                 async {
@@ -213,13 +225,27 @@ class GameController(apiKey: String, ctx: Context) {
         else Phase.context(st, 99, 1).let { TurnContext(false, it.myMovesLeft, it.opponentMovesAfterMe) }
 
         val plan = Planner(st).plan(reading.rack, ctx)
+
+        // Tüm bulmaca: her boş hücre için en olası harf (plan PAS olsa bile gösterilir).
+        val inf = Inference(st)
+        val refined = inf.refine(st.known)
+        val guesses = HashMap<CellPos, Guess>()
+        for (cell in st.emptyCells()) {
+            val top = inf.cellDist(cell, refined).maxByOrNull { it.value } ?: continue
+            guesses[cell] = Guess(top.key, top.value)
+        }
+        val solved = board.slots.count { st.emptyIn(it) == 0 || !st.cands[it].isNullOrEmpty() }
+
         val note = buildString {
             append(turns.label)
             if (!turns.endgame && st.inEndgame()) append(" — boş hücre ${st.emptyCells().size}, son 4 turu başlat!")
             if (turns.endgame && !turns.nextIsMine && !turns.finished) append(" (rakibin hamlesini bekle)")
             append("\nDB:${dbHits.get()} AI:${aiCalls.get()} (kayıtlı: ${db.size()})")
+            append("\nÇözülen yuva: $solved/${board.slots.size}, tahmin edilen hücre: ${guesses.size}/${st.emptyCells().size}")
+            if (lastAiError.isNotEmpty()) append("\nAI hatası: $lastAiError")
+            if (plan.pass) append("\nPAS: %50 üstü güvenli hamle yok. Turuncu/mavi harfler en olası cevaplar.")
         }
-        return Analysis(board, reading.rack, plan, note)
+        return Analysis(board, reading.rack, plan, note, guesses, solved, board.slots.size)
     }
 
     /**
@@ -264,6 +290,7 @@ class GameController(apiKey: String, ctx: Context) {
                 }
             } catch (e: Exception) {
                 aiFails.incrementAndGet()   // başarısız: asked'e eklenmez, sonraki analizde yeniden denenir
+                lastAiError = (e.message ?: e.javaClass.simpleName).take(160)
                 emptyList()
             }
         } ?: emptyList()
