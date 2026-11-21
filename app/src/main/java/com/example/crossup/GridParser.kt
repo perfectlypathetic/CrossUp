@@ -10,6 +10,8 @@ import kotlin.math.roundToInt
  *  1. Izgara sınırları: üst satır (tamamı yeşil ipucu satırı) ve sol sütun üzerinden bulunur.
  *  2. Hücre türü: hücre kenarındaki 10 px'lik halkanın rengine göre
  *       yeşil -> CLUE, beyaz -> EMPTY, diğer -> FILLED (harf konmuş; harfi okumak ayrı adım).
+ *  2b. DÜZELTME: kenara kadar taşan resimli ipucu hücreleri (ör. manzara resmi) yeşil halka vermez
+ *       ve FILLED sanılırdı. Hem ok işareti hem de "resim gibi karışık renkli halka" varsa CLUE yapılır.
  *  3. Ok algılama: siyah üçgenler ipucu hücresinin hemen dışında, komşu hücrenin kenarında durur.
  *       sağ ok -> ACROSS, alt ok -> DOWN.
  *  4. Bölünmüş (iki ipucu üst üste) hücre: sağ okun dikey konumu üst yarıdaysa
@@ -58,7 +60,8 @@ class ParserConfig(
     val white: Int = 0xFEFEFE,          // boş hücre
     val greenTol: Int = 40,
     val whiteTol: Int = 25,
-    val darkMax: Int = 90               // ok üçgeni: R,G,B hepsi bunun altında
+    val darkMax: Int = 90,              // ok üçgeni: R,G,B hepsi bunun altında
+    val busyRingMin: Double = 45.0      // resimli hücre: halkadaki renk dağılımı bundan büyükse "resim"
 )
 
 class GridParser(private val cfg: ParserConfig = ParserConfig()) {
@@ -104,7 +107,18 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
         val rects = List(rows) { r -> List(cfg.cols) { c -> rect(r, c) } }
 
         // 3) Hücre türleri.
-        val kinds = List(rows) { r -> List(cfg.cols) { c -> classify(src, rects[r][c]) } }
+        val kinds = List(rows) { r -> MutableList(cfg.cols) { c -> classify(src, rects[r][c]) } }
+
+        // 3b) Kenara kadar taşan resimli ipucu hücrelerini (FILLED sanılanları) CLUE yap.
+        for (r in 0 until rows) for (c in 0 until cfg.cols) {
+            if (kinds[r][c] != CellKind.FILLED) continue
+            val rc = rects[r][c]
+            val h = rc.y1 - rc.y0
+            val w = rc.x1 - rc.x0
+            val hasRight = c + 1 < cfg.cols && isArrowSize(rightArrowRows(src, rc), h)
+            val hasDown = r + 1 < rows && isArrowSize(downArrowCols(src, rc), w)
+            if ((hasRight || hasDown) && ringIsBusy(src, rc)) kinds[r][c] = CellKind.CLUE
+        }
 
         // 4) Oklar ve kelime yuvaları.
         val slots = ArrayList<WordSlot>()
@@ -168,6 +182,36 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
         }
     }
 
+    /**
+     * Hücrenin kenar halkasındaki renkler çok mu dağınık? (resim: evet, düz renkli harf karosu: hayır)
+     */
+    private fun ringIsBusy(src: PixelSource, rc: Rect): Boolean {
+        val px = ArrayList<Int>()
+        fun sample(x0: Int, y0: Int, x1: Int, y1: Int) {
+            var y = y0
+            while (y < y1) {
+                var x = x0
+                while (x < x1) { px.add(src.rgb(x, y)); x += 3 }
+                y += 3
+            }
+        }
+        val m0 = 6; val m1 = 16
+        sample(rc.x0 + m0, rc.y0 + m0, rc.x1 - m0, rc.y0 + m1)
+        sample(rc.x0 + m0, rc.y1 - m1, rc.x1 - m0, rc.y1 - m0)
+        sample(rc.x0 + m0, rc.y0 + m0, rc.x0 + m1, rc.y1 - m0)
+        sample(rc.x1 - m1, rc.y0 + m0, rc.x1 - m0, rc.y1 - m0)
+        if (px.isEmpty()) return false
+
+        var mr = 0.0; var mg = 0.0; var mb = 0.0
+        for (p in px) { mr += (p shr 16) and 0xFF; mg += (p shr 8) and 0xFF; mb += p and 0xFF }
+        mr /= px.size; mg /= px.size; mb /= px.size
+        var dev = 0.0
+        for (p in px) {
+            dev += abs(((p shr 16) and 0xFF) - mr) + abs(((p shr 8) and 0xFF) - mg) + abs((p and 0xFF) - mb)
+        }
+        return dev / px.size > cfg.busyRingMin
+    }
+
     // ---- ok algılama ----
 
     /** Hücrenin sağ kenarının hemen dışındaki siyah üçgenin dikey konumu (0..1); yoksa null. */
@@ -191,6 +235,27 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
         }
         return count >= 6
     }
+
+    /** Sağ kenarın dışında koyu piksel içeren satır sayısı. */
+    private fun rightArrowRows(src: PixelSource, rc: Rect): Int {
+        var count = 0
+        for (y in rc.y0 + 8 until rc.y1 - 8) {
+            for (x in rc.x1 + 2..rc.x1 + 15) if (isDark(src.rgb(x, y))) { count++; break }
+        }
+        return count
+    }
+
+    /** Alt kenarın dışında koyu piksel içeren sütun sayısı. */
+    private fun downArrowCols(src: PixelSource, rc: Rect): Int {
+        var count = 0
+        for (x in rc.x0 + 8 until rc.x1 - 8) {
+            for (y in rc.y1 + 2..rc.y1 + 15) if (isDark(src.rgb(x, y))) { count++; break }
+        }
+        return count
+    }
+
+    /** Üçgen boyutunda mı? Çok küçük (gürültü) veya çok büyük (karo çerçevesi/yazı) olmamalı. */
+    private fun isArrowSize(count: Int, len: Int) = count >= 6 && count <= len * 0.4
 
     // ---- yardımcılar ----
 
