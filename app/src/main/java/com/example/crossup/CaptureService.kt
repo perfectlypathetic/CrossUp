@@ -115,7 +115,11 @@ class CaptureService : Service() {
         wm.addView(markers, WindowManager.LayoutParams(-1, -1, type,
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT).apply { gravity = Gravity.TOP or Gravity.START })
+            PixelFormat.TRANSLUCENT).apply {
+                gravity = Gravity.TOP or Gravity.START
+                // Çentikli ekranlarda işaretlerin kaymaması için tüm ekranı kapla.
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            })
 
         status = TextView(this).apply {
             setTextColor(Color.WHITE); textSize = 13f
@@ -327,7 +331,8 @@ class CaptureService : Service() {
         val moves = if (a.plan.pass) "PAS" else a.plan.placements.joinToString("  ") {
             "${it.letter}→(${it.cell.r + 1},${it.cell.c + 1}) %${(it.p * 100).toInt()}"
         }
-        status.text = "Raf: ${a.rack.joinToString("")}\n$moves  EV=${"%.1f".format(a.plan.expectedValue)}\n${a.note}"
+        status.text = "Raf: ${a.rack.joinToString("")}\n$moves  EV=${"%.1f".format(a.plan.expectedValue)}\n" +
+            "Kırmızı=plan, turuncu=rafta var, mavi=diğer tahmin\n${a.note}"
     }
 
     private fun notification(): Notification {
@@ -346,15 +351,44 @@ class CaptureService : Service() {
     }
 }
 
-/** Planlanan harfleri ilgili hücrelerin üstüne çizer (ekran görüntüsü koordinatı = ekran koordinatı). */
+/**
+ * Hücrelerin üstüne çizer (ekran görüntüsü koordinatı = ekran koordinatı).
+ *  - Kırmızı büyük daire: planın önerdiği hamle.
+ *  - Turuncu: en olası harf, rafında var.
+ *  - Mavi: en olası harf, rafında yok (sonraki turlar için bilgi).
+ */
 class MarkerView(ctx: Context) : View(ctx) {
     private var a: Analysis? = null
     private val bg = Paint().apply { color = 0xCCE53935.toInt(); style = Paint.Style.FILL }
+    private val bgRack = Paint().apply { color = 0xCCFB8C00.toInt(); style = Paint.Style.FILL }
+    private val bgGuess = Paint().apply { color = 0xAA1E88E5.toInt(); style = Paint.Style.FILL }
     private val tx = Paint().apply { color = Color.WHITE; textAlign = Paint.Align.CENTER; isFakeBoldText = true; isAntiAlias = true }
+    private val small = Paint().apply { color = Color.BLACK; textAlign = Paint.Align.CENTER; isFakeBoldText = true; isAntiAlias = true }
+
     fun set(x: Analysis) { a = x; invalidate() }
     fun clear() { a = null; invalidate() }
+
     override fun onDraw(c: Canvas) {
         val an = a ?: return
+        val planned = an.plan.placements.map { it.cell }.toSet()
+        val rackSet = an.rack.toSet()
+
+        // Tüm bulmaca tahmini (önce çizilir, planın altında kalır).
+        for ((cell, g) in an.guesses) {
+            if (cell in planned) continue
+            val r = an.board.cellRects[cell.r][cell.c]
+            val cx = (r.x0 + r.x1) / 2f; val cy = (r.y0 + r.y1) / 2f
+            val rad = (r.x1 - r.x0) * 0.30f
+            c.drawCircle(cx, cy, rad, if (g.letter in rackSet) bgRack else bgGuess)
+            tx.textSize = rad * 1.3f
+            c.drawText(g.letter.toString(), cx, cy + tx.textSize * 0.35f, tx)
+            if (g.p < 0.95) {
+                small.textSize = rad * 0.65f
+                c.drawText("%${(g.p * 100).toInt()}", cx, r.y1 - rad * 0.12f, small)
+            }
+        }
+
+        // Planın önerdiği hamleler.
         for (pl in an.plan.placements) {
             val r = an.board.cellRects[pl.cell.r][pl.cell.c]
             val cx = (r.x0 + r.x1) / 2f; val cy = (r.y0 + r.y1) / 2f
