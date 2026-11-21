@@ -9,6 +9,8 @@ import android.os.Bundle
 import android.provider.Settings
 import android.widget.*
 import com.example.crossup.ai.ClueDb
+import com.example.crossup.ai.CloudSync
+import com.example.crossup.ai.LetterDb
 import com.example.crossup.service.CaptureService
 
 class MainActivity : Activity() {
@@ -19,6 +21,8 @@ class MainActivity : Activity() {
         const val REQ_PROJECTION = 100
         const val REQ_EXPORT = 101
         const val REQ_IMPORT = 102
+        const val REQ_CLOUD_NEW = 103
+        const val REQ_CLOUD_PICK = 104
     }
 
     override fun onCreate(s: Bundle?) {
@@ -38,20 +42,52 @@ class MainActivity : Activity() {
 
         info = TextView(this).apply { textSize = 14f; setPadding(0, 40, 0, 10) }
 
-        val export = Button(this).apply {
-            text = "Kelimeleri dışa aktar (yedekle)"
+        val cloudNew = Button(this).apply {
+            text = "Bulut: yeni dosya oluştur (ilk cihaz)"
             setOnClickListener {
                 startActivityForResult(
                     Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
                         addCategory(Intent.CATEGORY_OPENABLE)
                         type = "application/json"
-                        putExtra(Intent.EXTRA_TITLE, "crossup_kelimeler.json")
+                        putExtra(Intent.EXTRA_TITLE, "crossup_bulut.json")
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                    }, REQ_CLOUD_NEW
+                )
+            }
+        }
+        val cloudPick = Button(this).apply {
+            text = "Bulut: mevcut dosyayı seç (diğer cihaz)"
+            setOnClickListener {
+                startActivityForResult(
+                    Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "*/*"
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                    }, REQ_CLOUD_PICK
+                )
+            }
+        }
+        val cloudOff = Button(this).apply {
+            text = "Bulut bağlantısını kes"
+            setOnClickListener { CloudSync.disconnect(this@MainActivity); refreshInfo() }
+        }
+
+        val export = Button(this).apply {
+            text = "Verileri dışa aktar (elle yedek)"
+            setOnClickListener {
+                startActivityForResult(
+                    Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "application/json"
+                        putExtra(Intent.EXTRA_TITLE, "crossup_yedek.json")
                     }, REQ_EXPORT
                 )
             }
         }
         val import = Button(this).apply {
-            text = "Kelimeleri içe aktar (yedekten)"
+            text = "Verileri içe aktar (elle yedekten)"
             setOnClickListener {
                 startActivityForResult(
                     Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
@@ -62,20 +98,35 @@ class MainActivity : Activity() {
             }
         }
 
-        setContentView(LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40)
-            addView(keyBox); addView(go); addView(info); addView(export); addView(import)
+        setContentView(ScrollView(this).apply {
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40)
+                addView(keyBox); addView(go); addView(info)
+                addView(cloudNew); addView(cloudPick); addView(cloudOff)
+                addView(export); addView(import)
+            })
         })
     }
 
     override fun onResume() {
         super.onResume()
         refreshInfo()
+        // Bulut bağlıysa arka planda eşitle.
+        if (CloudSync.uri(this) != null) {
+            Thread {
+                CloudSync.sync(applicationContext)
+                runOnUiThread { refreshInfo() }
+            }.start()
+        }
     }
 
     private fun refreshInfo() {
+        val cloud = if (CloudSync.uri(this) == null) "Bulut: bağlı değil"
+        else "Bulut: bağlı\n" + CloudSync.lastMessage(this)
         info.text = "Kayıtlı kelime: ${ClueDb.get(this).size()}\n" +
-            "Yeni sürüm kurmadan / uygulamayı silmeden önce \"dışa aktar\" ile yedek al."
+            "Kayıtlı harf şablonu: ${LetterDb.get(this).size()}\n" +
+            cloud + "\n" +
+            "API anahtarı buluta kaydedilmez, yeni cihazda elle yapıştır."
     }
 
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
@@ -88,11 +139,23 @@ class MainActivity : Activity() {
                     .putExtra("code", res).putExtra("data", data).putExtra("key", keyBox.text.toString().trim()))
                 moveTaskToBack(true)   // Bundle'a geç
             }
+            REQ_CLOUD_NEW, REQ_CLOUD_PICK -> {
+                val uri = data.data ?: return
+                CloudSync.setUri(this, uri, data.flags)
+                Toast.makeText(this, "Eşitleniyor…", Toast.LENGTH_SHORT).show()
+                Thread {
+                    val msg = CloudSync.sync(applicationContext)
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
+                        refreshInfo()
+                    }
+                }.start()
+            }
             REQ_EXPORT -> {
                 val uri = data.data ?: return
                 Thread {
                     val msg = try {
-                        contentResolver.openOutputStream(uri, "wt")!!.use { ClueDb.get(this@MainActivity).exportTo(it) }
+                        contentResolver.openOutputStream(uri, "wt")!!.use { CloudSync.exportTo(this@MainActivity, it) }
                         "Yedek kaydedildi."
                     } catch (e: Exception) { "Hata: ${e.message}" }
                     runOnUiThread { Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show() }
@@ -102,8 +165,8 @@ class MainActivity : Activity() {
                 val uri = data.data ?: return
                 Thread {
                     val msg = try {
-                        val added = contentResolver.openInputStream(uri)!!.use { ClueDb.get(this@MainActivity).importFrom(it) }
-                        "$added yeni kelime eklendi."
+                        val added = contentResolver.openInputStream(uri)!!.use { CloudSync.importFrom(this@MainActivity, it) }
+                        "$added yeni kayıt eklendi."
                     } catch (e: Exception) { "Okunamadı: ${e.message}" }
                     runOnUiThread {
                         Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
