@@ -124,19 +124,46 @@ class LetterDb private constructor(ctx: Context) {
     /** Doğrulanmış harfi şablon olarak kaydeder (çok benzer şablon varsa eklemez). */
     @Synchronized
     fun learn(fp: Fp, ch: Char) {
-        if (list.any { it.ch == ch && dist(it.fp, fp) <= 4 }) return
+        if (add(fp, ch)) save()
+    }
+
+    private fun add(fp: Fp, ch: Char): Boolean {
+        if (list.any { it.ch == ch && dist(it.fp, fp) <= 4 }) return false
         list.add(T(fp, ch))
-        save()
+        return true
     }
 
     @Synchronized
     fun size(): Int = list.size
 
+    /** Bulut eşitleme için tüm şablonları JSON olarak verir. */
+    @Synchronized
+    fun snapshot(): JSONArray = toJsonArray()
+
+    /** JSON'daki şablonları birleştirerek ekler. Yeni eklenen şablon sayısını döner. */
+    @Synchronized
+    fun mergeJson(a: JSONArray): Int {
+        var added = 0
+        for (i in 0 until a.length()) {
+            runCatching {
+                val o = a.getJSONObject(i)
+                val fp = Fp(o.getString("b"), o.getDouble("a").toFloat())
+                if (add(fp, o.getString("c")[0])) added++
+            }
+        }
+        if (added > 0) save()
+        return added
+    }
+
+    private fun toJsonArray(): JSONArray {
+        val a = JSONArray()
+        for (t in list) a.put(JSONObject().put("b", t.fp.bits).put("a", t.fp.aspect.toDouble()).put("c", t.ch.toString()))
+        return a
+    }
+
     private fun save() {
         runCatching {
-            val a = JSONArray()
-            for (t in list) a.put(JSONObject().put("b", t.fp.bits).put("a", t.fp.aspect.toDouble()).put("c", t.ch.toString()))
-            val json = a.toString()
+            val json = toJsonArray().toString()
             tmp.writeText(json)
             if (!tmp.renameTo(file)) file.writeText(json)
         }
