@@ -25,17 +25,21 @@ class TdkMatcher(ctx: Context) {
     private val db = TdkDb.get(ctx)
     private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
 
+    /** Son candidates() çağrısının sonucu (teşhis için): neden çözüldü / neden elendi. */
+    @Volatile var lastReason: String = ""
+        private set
+
     companion object {
         private const val TAG = "TdkMatcher"
 
         /** En iyi adayın puanı bundan düşükse güvenme (null dön). Ayar: büyütürsen daha temkinli olur. */
-        const val MIN_TOP = 4.5
+        const val MIN_TOP = 3.0
         /** En iyi puanın bu oranından düşük adaylar listeye girmez. */
         const val KEEP_RATIO = 0.5
         /** En fazla kaç aday döner. */
-        const val MAX_CANDS = 8
+        const val MAX_CANDS = 10
         /** En iyi puana yakın (>= %90) bu kadardan çok aday varsa belirsizdir (null dön). */
-        const val MAX_TIED = 12
+        const val MAX_TIED = 30
         /** OCR'dan en az bu kadar harf okunmalı, yoksa resimli ipucu sayılır. */
         const val MIN_LETTERS = 4
         /** OCR öncesi görüntü bu yüksekliğe (piksel) büyütülür (en çok 4 kat). */
@@ -69,30 +73,37 @@ class TdkMatcher(ctx: Context) {
      * OCR metninden aday üretir.
      * null  = güven düşük / yazı yok / TDK'da uygun kelime yok -> Gemini'ye git.
      * liste = en olası adaylar (weight: en iyiye göre göreli).
+     * Sonucun nedeni lastReason'da durur.
      */
     fun candidates(clueText: String, length: Int, pattern: String): List<Candidate>? {
-        if (!db.isLoaded) return null
-        if (clueText.count { it.isLetter() } < MIN_LETTERS) return null
+        lastReason = ""
+        if (!db.isLoaded) { lastReason = "sözlük yüklü değil"; return null }
+        if (clueText.count { it.isLetter() } < MIN_LETTERS) {
+            lastReason = "yazı okunamadı (resimli?)"; return null
+        }
 
         val q = TdkDb.stems(clueText)
-        if (q.isEmpty()) return null
+        if (q.isEmpty()) { lastReason = "anahtar kelime yok"; return null }
 
         val hits = db.search(length, pattern, q)
-        if (hits.isEmpty()) return null
+        if (hits.isEmpty()) { lastReason = "sözlükte eşleşme yok"; return null }
 
         val top = hits[0].score
         if (top < MIN_TOP) {
-            Log.d(TAG, "düşük güven (%.1f): \"$clueText\" -> ${hits.first().word}".format(top))
+            lastReason = "düşük güven (" + String.format("%.1f", top) + ") en iyi: " + hits.first().word
+            Log.d(TAG, "düşük güven: \"" + clueText + "\" -> " + hits.first().word)
             return null
         }
         val tied = hits.count { it.score >= top * 0.9 }
         if (tied > MAX_TIED) {
-            Log.d(TAG, "belirsiz ($tied eşit aday): \"$clueText\"")
+            lastReason = "belirsiz ($tied eşit aday)"
+            Log.d(TAG, "belirsiz ($tied eşit aday): \"" + clueText + "\"")
             return null
         }
 
         val keep = hits.filter { it.score >= top * KEEP_RATIO }.take(MAX_CANDS)
-        Log.d(TAG, "\"$clueText\" -> " + keep.joinToString { "${it.word}(%.1f)".format(it.score) })
+        lastReason = "ÇÖZÜLDÜ: " + keep.take(3).joinToString(",") { it.word }
+        Log.d(TAG, "\"" + clueText + "\" -> " + keep.joinToString { it.word + "(" + String.format("%.1f", it.score) + ")" })
         return keep.map {
             val r = it.score / top
             Candidate(it.word, (r * r).coerceAtLeast(0.05))
