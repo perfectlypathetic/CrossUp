@@ -4,17 +4,11 @@ import android.content.Context
 import android.graphics.Bitmap
 import com.example.crossup.ai.AskLetter
 import com.example.crossup.ai.ClueDb
+import com.example.crossup.ai.ClueQuery
 import com.example.crossup.ai.GeminiClueSolver
 import com.example.crossup.ai.LetterReader
 import com.example.crossup.parser.*
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
-import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
 
 /** Son 4 tur sırası. Kullanıcı butonla başlatır; her turdan sonra "ilerle" ile bir adım atlanır. */
 class TurnTracker {
@@ -74,12 +68,8 @@ class LetterResult(
 
 class GameController(apiKey: String, ctx: Context) {
     companion object {
-        /** Üst üste bu kadar AI hatasında o analizde AI'a sormayı bırak (kota/ağ sorunu). */
-        const val MAX_AI_FAILS = 5
         /** Bir analizde AI ile ipucu çözmeye ayrılan toplam süre. */
         const val AI_TIME_LIMIT_MS = 120_000L
-        /** Aynı anda en fazla bu kadar AI isteği (kota hatasını önlemek için düşük tutulur). */
-        const val AI_PARALLEL = 4
     }
 
     private val parser = GridParser()
@@ -95,6 +85,9 @@ class GameController(apiKey: String, ctx: Context) {
     private val asked: MutableSet<String> = ConcurrentHashMap.newKeySet()
     /** Son AI hatası (sadece "hata oldu mu" bilgisi için). */
     @Volatile private var lastAiError = ""
+
+    /** AI'a sorulması gereken yuva. */
+    private class Pending(val slot: WordSlot, val key: String, val pattern: String, val crop: Bitmap)
 
     private fun slotKey(s: WordSlot) = "${s.dir}${s.clueCell.r},${s.clueCell.c}:${s.length}"
 
@@ -165,7 +158,7 @@ class GameController(apiKey: String, ctx: Context) {
     /**
      * ANALİZ: Harf sormaz (sadece kayıtlı şablonlarla okur).
      * Sadece RAFTAKİ harfler okunamazsa durur. Tahtadaki tanınmayan hücreler yok sayılır.
-     * İpuçları oyun boyunca en fazla bir kez AI'a sorulur.
+     * İpuçları: önce bellek ve telefondaki veritabanı, kalanlar TEK TOPLU istekle AI'a sorulur.
      */
     suspend fun analyze(bmp: Bitmap, progress: (String) -> Unit = {}): Analysis {
         progress("Izgara aranıyor…")
@@ -198,24 +191,45 @@ class GameController(apiKey: String, ctx: Context) {
 
         // İpucu çözümü: sadece henüz bitmemiş yuvalar.
         val todo = board.slots.filter { st.emptyIn(it) > 0 }.sortedBy { st.emptyIn(it) }
-        val done = AtomicInteger(0)
-        val dbHits = AtomicInteger(0)
-        val aiCalls = AtomicInteger(0)
-        val aiFails = AtomicInteger(0)
-        progress("Raf: ${reading.rack.joinToString("")} — ipuçları çözülüyor 0/${todo.size}")
-        val sem = Semaphore(AI_PARALLEL)
-        val results = coroutineScope {
-            todo.map { s ->
-                async {
-                    sem.withPermit {
-                        val c = candsFor(s, st, bmp, deadline, dbHits, aiCalls, aiFails)
-                        progress("İpuçları çözülüyor ${done.incrementAndGet()}/${todo.size}")
-                        s to c
+        progress("Raf: ${reading.rack.joinToString("")} — ${todo.size} ipucu kontrol ediliyor")
+
+        // 1. aşama: bellek + telefondaki veritabanı (anında, kotasız).
+        val results = HashMap<WordSlot, List<Candidate>>()
+        val pending = ArrayList<Pending>()
+        for (s in todo) {
+            val key = slotKey(s)
+            val pattern = s.cells.map { st.known[it] ?: '?' }.joinToString("")
+            val crop = bmp.crop(s.clueRect)
+            val local = localCands(s, key, pattern, crop)
+            if (local != null) results[s] = local else pending.add(Pending(s, key, pattern, crop))
+        }
+
+        // 2. aşama: kalanlar tek toplu AI isteğiyle (SON ÇARE).
+        if (pending.isNotEmpty()) {
+            if (deadline - System.currentTimeMillis() < 3000) {
+                lastAiError = "süre doldu"
+                for (p in pending) results[p.slot] = emptyList()
+            } else {
+                progress("Yapay zekaya ${pending.size} ipucu toplu soruluyor…")
+                val answers = solver.solveBatch(
+                    pending.map { ClueQuery(it.crop.toPng(), it.slot.length, it.pattern) }, deadline
+                )
+                var missing = 0
+                pending.forEachIndexed { i, p ->
+                    val a = answers.getOrNull(i)
+                    if (a != null) {
+                        candCache[p.key] = a
+                        asked.add(p.key)        // cevap geldi: bu oyunda bir daha sorulmaz
+                        results[p.slot] = a
+                    } else {
+                        missing++               // asked'e eklenmez, sonraki analizde yeniden denenir
+                        results[p.slot] = emptyList()
                     }
                 }
-            }.awaitAll()
+                if (missing > 0) lastAiError = solver.lastError.ifEmpty { "bazı ipuçları için cevap gelmedi" }
+            }
         }
-        for ((s, c) in results) st.cands[s] = c      // tek thread'de yaz
+        for ((s, c) in results) st.cands[s] = c
 
         progress("Hamle planlanıyor…")
         val ctx = if (turns.endgame)
@@ -240,14 +254,10 @@ class GameController(apiKey: String, ctx: Context) {
     }
 
     /**
-     * Sıra: 1) bellek  2) telefondaki veritabanı  3) yapay zeka (SON ÇARE, yuva başına en fazla BİR KEZ).
+     * AI'sız çözüm: 1) bellek  2) telefondaki veritabanı.
+     * Liste dönerse yuva çözülmüştür (boş olabilir). null dönerse AI'a sorulmalıdır.
      */
-    private suspend fun candsFor(
-        s: WordSlot, st: GameState, bmp: Bitmap, deadline: Long,
-        dbHits: AtomicInteger, aiCalls: AtomicInteger, aiFails: AtomicInteger
-    ): List<Candidate> {
-        val key = slotKey(s)
-        val pattern = s.cells.map { st.known[it] ?: '?' }.joinToString("")
+    private fun localCands(s: WordSlot, key: String, pattern: String, crop: Bitmap): List<Candidate>? {
         fun fits(w: String) = w.indices.all { pattern[it] == '?' || pattern[it] == w[it] }
 
         // 1) Bellek: kayıtlı adaylar, tahtadaki yeni harflere göre elenir.
@@ -256,34 +266,12 @@ class GameController(apiKey: String, ctx: Context) {
             if (f.isNotEmpty() || key in asked) return f   // AI zaten sorulduysa bir daha sorma
         }
 
-        val crop = bmp.crop(s.clueRect)
-
-        // 2) Telefondaki veritabanı (anında, kotasız)
+        // 2) Telefondaki veritabanı
         val hit = db.get(db.key(crop), s.length).filter { fits(it) }
-        if (hit.isNotEmpty()) {
-            dbHits.incrementAndGet()
-            return hit.map { Candidate(it, 1.0) }.also { candCache[key] = it }
-        }
+        if (hit.isNotEmpty()) return hit.map { Candidate(it, 1.0) }.also { candCache[key] = it }
 
-        // 3) Yapay zeka: bu yuva için hiç sorulmadıysa
+        // 3) AI zaten sorulduysa tekrar sorma.
         if (key in asked) return emptyList()
-        if (aiFails.get() >= MAX_AI_FAILS) return emptyList()   // kota/ağ sorunu: israf etme, sonraki analizde dener
-        val left = deadline - System.currentTimeMillis()
-        if (left < 3000) return emptyList()
-
-        return withTimeoutOrNull(left) {
-            try {
-                aiCalls.incrementAndGet()
-                solver.solve(crop.toPng(), s.length, pattern).also {
-                    candCache[key] = it
-                    asked.add(key)          // başarılı: bu oyunda bir daha sorulmaz
-                    aiFails.set(0)
-                }
-            } catch (e: Exception) {
-                aiFails.incrementAndGet()   // başarısız: asked'e eklenmez, sonraki analizde yeniden denenir
-                lastAiError = (e.message ?: e.javaClass.simpleName).take(160)
-                emptyList()
-            }
-        } ?: emptyList()
+        return null
     }
 }
