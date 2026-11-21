@@ -51,6 +51,9 @@ class TdkMatcher(ctx: Context) {
 
     val ready: Boolean get() = db.isLoaded
 
+    /** Sözlük yüklenemediyse sebebi (teşhis için). */
+    val loadError: String get() = db.lastError
+
     /** İpucu görüntüsündeki yazıyı okur. Okunamazsa boş metin döner. */
     suspend fun readClue(crop: Bitmap): String {
         if (!db.isLoaded) return ""
