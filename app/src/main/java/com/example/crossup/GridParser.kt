@@ -78,20 +78,28 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
         var minX = Int.MAX_VALUE
         var maxX = -1
         var lastGreen = top
-        val gap = (src.width * 0.15).toInt()
+        val gap = (src.width * 0.22).toInt()
         var yy = top
         while (yy < src.height) {
-            var any = false
+            // Satırda yeterince yeşil yoksa (birkaç tek tük piksel: buton kenarı, rozet, yazı kenarı)
+            // bu satır ızgaraya ait sayılmaz. Bu, tahtanın altını yanlış hesaplamayı önler.
+            var cnt = 0
+            var rMin = Int.MAX_VALUE
+            var rMax = -1
             var x = 0
             while (x < src.width) {
                 if (isGreen(src.rgb(x, yy))) {
-                    any = true
-                    if (x < minX) minX = x
-                    if (x > maxX) maxX = x
+                    cnt++
+                    if (x < rMin) rMin = x
+                    if (x > rMax) rMax = x
                 }
                 x += 2
             }
-            if (any) lastGreen = yy else if (yy - lastGreen > gap) break
+            if (cnt >= 10) {
+                lastGreen = yy
+                if (rMin < minX) minX = rMin
+                if (rMax > maxX) maxX = rMax
+            } else if (yy - lastGreen > gap) break
             yy += 2
         }
         if (maxX < 0) return null
@@ -316,7 +324,12 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
 
     private fun inset(rc: Rect) = Rect(rc.x0 + 3, rc.y0 + 3, rc.x1 - 3, rc.y1 - 3)
 
-    private fun isGreen(p: Int) = near(p, cfg.clueGreen, cfg.greenTol)
+    /** Ipucu yeşili: renge yakın VE gerçekten yeşilimsi (açık gri butonlar yeşil sayılmaz). */
+    private fun isGreen(p: Int): Boolean {
+        if (!near(p, cfg.clueGreen, cfg.greenTol)) return false
+        val r = (p shr 16) and 0xFF; val g = (p shr 8) and 0xFF; val b = p and 0xFF
+        return g - r >= 8 && g - b >= 15
+    }
     private fun isWhite(p: Int) = near(p, cfg.white, cfg.whiteTol)
     private fun isDark(p: Int) =
         maxOf((p shr 16) and 0xFF, (p shr 8) and 0xFF, p and 0xFF) < cfg.darkMax
