@@ -3,6 +3,10 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// GitHub Actions bu iki değeri otomatik verir. Yerelde verilmezse varsayılanlar kullanılır.
+val buildNumber: Int = (providers.gradleProperty("buildNumber").orNull ?: "1").toInt()
+val ghRepo: String = providers.gradleProperty("ghRepo").orNull ?: ""
+
 android {
     namespace = "com.example.crossup"
     compileSdk = 35
@@ -11,8 +15,38 @@ android {
         applicationId = "com.example.crossup"
         minSdk = 30
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = buildNumber
+        versionName = "1.$buildNumber"
+
+        buildConfigField("int", "BUILD_NUMBER", buildNumber.toString())
+        buildConfigField("String", "GH_REPO", "\"$ghRepo\"")
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    signingConfigs {
+        create("crossup") {
+            storeFile = file("crossup.jks")
+            storePassword = "crossup123"
+            keyAlias = "crossup"
+            keyPassword = "crossup123"
+        }
+    }
+
+    buildTypes {
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("crossup")
+        }
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("crossup")
+        }
+    }
+
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
     }
 
     compileOptions {
