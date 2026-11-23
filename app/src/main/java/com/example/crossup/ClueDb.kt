@@ -22,8 +22,12 @@ class ClueDb private constructor(ctx: Context) {
     private val map = HashMap<String, MutableSet<String>>()
 
     companion object {
-        /** 256 bitte bu kadar veya daha az fark = aynı ipucu. */
-        const val MAX_DIST = 22
+        /**
+         * 256 bitte bu kadar veya daha az fark = aynı ipucu.
+         * Ölçüm: aynı ipucu 1 piksel kayınca en fazla ~13 fark çıkar; farklı iki yazılı ipucu
+         * (MİHRAK / APTAL) 18 fark çıkardı. Eski değer 22 bunları karıştırıyordu.
+         */
+        const val MAX_DIST = 15
         private const val N = 16
 
         @Volatile private var inst: ClueDb? = null
