@@ -76,7 +76,7 @@ class CaptureService : Service() {
 
     private suspend fun capture(): Bitmap {
         setOverlayVisible(false)
-        delay(350)                                   // overlay kaybolsun, yeni kare gelsin
+        delay(700)                                   // overlay kaybolsun, yeni kare gelsin (panel yakalanmasın)
         val bmp = synchronized(lock) { held?.toBitmap() }
         setOverlayVisible(true)
         return bmp ?: error("Ekran karesi alınamadı")
