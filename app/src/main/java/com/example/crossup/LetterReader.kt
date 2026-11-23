@@ -58,8 +58,12 @@ class LetterReader(ctx: Context) {
 
     suspend fun read(
         bmp: Bitmap, board: ParsedBoard, need: List<CellPos>,
-        ask: AskLetter?, includeRack: Boolean
+        ask: AskLetter?, includeRack: Boolean,
+        relaxBoard: Boolean = false
     ): Reading {
+        // 29 harfin hepsi kayıtlıysa kullanıcıya ASLA harf sorulmaz.
+        val complete = db.isComplete()
+        val askFn: AskLetter? = if (complete) null else ask
         val items = ArrayList<Item>()
         var rackMissing = 0   // rafta olup okunamayan / hiç bulunamayan karolar
 
@@ -93,20 +97,32 @@ class LetterReader(ctx: Context) {
             val again = db.match(next.fp)          // önceki cevaplar yüzünden artık eşleşebilir
             if (again != null) { next.ch = again; continue }
 
-            if (skippedFps.any { LetterDb.dist(it, next.fp) <= 20 } || ask == null) {
+            if (skippedFps.any { LetterDb.dist(it, next.fp) <= 20 } || askFn == null) {
                 next.skipped = true
                 continue
             }
 
             val remaining = items.count { it.ch == null && !it.skipped }
             val guess = guess(next.crop)
-            val answer = ask(next.crop, guess, remaining)
+            val answer = askFn(next.crop, guess, remaining)
             if (answer == null) {
                 skippedFps.add(next.fp)
                 next.skipped = true
             } else {
                 db.learn(next.fp, answer)
                 next.ch = answer
+            }
+        }
+
+        // 4) Yedek: eşleşmeyen karolar için en yakın şablon.
+        //    Raf karoları her zaman harftir; tahtada ise sadece "relaxBoard" açıksa gevşek eşleşme denenir.
+        //    Bu tahminler veritabanına KAYDEDİLMEZ.
+        for (item in items) {
+            if (item.ch != null) continue
+            if (item.rackIdx >= 0) {
+                item.ch = db.nearest(item.fp, if (complete) 120 else 45)
+            } else if (relaxBoard) {
+                item.ch = db.matchRelaxed(item.fp)
             }
         }
 
@@ -180,6 +196,10 @@ class LetterReader(ctx: Context) {
             info.append("; yedek yöntem")
             tiles = locateByInk(bmp, cw, yStart, yEnd, info)
         }
+        if (tiles.isEmpty()) {
+            info.append("; renk yöntemi")
+            tiles = locateByTileColor(bmp, cw, info)
+        }
         lastRackInfo = info.append("; bulunan karo=${tiles.size}").toString()
         return tiles
     }
@@ -234,6 +254,54 @@ class LetterReader(ctx: Context) {
             } else if (start >= 0 && x - lastD > 4) close()
         }
         close()
+        return runs
+    }
+
+    /** Raf karosunun şeftali rengi (255,216,173). */
+    private fun isTile(p: Int): Boolean =
+        abs(((p shr 16) and 0xFF) - 255) + abs(((p shr 8) and 0xFF) - 216) + abs((p and 0xFF) - 173) < 50
+
+    /**
+     * Yöntem 3 (son çare): karoların şeftali rengiyle arar. Tahtanın alt sınırına GÜVENMEZ;
+     * ekranın alt %45'inde, en alttaki şeftali bandı raftır.
+     */
+    private fun locateByTileColor(bmp: Bitmap, cw: Int, info: StringBuilder): List<Rect> {
+        val w = bmp.width; val h = bmp.height
+        val yFrom = (h * 0.55).toInt()
+        fun rowCount(y: Int): Int {
+            var n = 0; var x = 0
+            while (x < w) { if (isTile(bmp.getPixel(x, y))) n++; x += 3 }
+            return n
+        }
+        var bot = -1
+        var y = h - 1
+        while (y >= yFrom) {
+            if (rowCount(y) * 3 >= cw * 0.6) { bot = y; break }
+            y--
+        }
+        if (bot < 0) { info.append("; şeftali piksel yok"); return emptyList() }
+        var top = bot
+        while (top - 1 >= yFrom && rowCount(top - 1) * 3 >= cw * 0.5) top--
+        if (bot - top < cw / 2) { info.append("; şeftali bant ince"); return emptyList() }
+
+        val line = top + ((bot - top) * 0.15).toInt()
+        val runs = ArrayList<Rect>()
+        var start = -1; var lastD = -100
+        fun close() {
+            if (start >= 0) {
+                val len = lastD - start + 1
+                if (len >= cw * 0.5 && len <= cw * 1.4) runs.add(Rect(start, top, lastD + 1, bot + 1))
+                start = -1
+            }
+        }
+        for (x in 0 until w) {
+            if (isTile(bmp.getPixel(x, line))) {
+                if (start < 0) start = x
+                lastD = x
+            } else if (start >= 0 && x - lastD > 4) close()
+        }
+        close()
+        info.append("; şeftali bant=$top..$bot")
         return runs
     }
 
