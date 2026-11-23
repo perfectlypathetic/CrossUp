@@ -145,7 +145,7 @@ class GameController(apiKey: String, ctx: Context) {
         val filled = board.cellsOf(CellKind.FILLED)
         val need = filled.filter { it !in letterCache }
         progress("Harfler okunuyor…")
-        val reading = letters.read(bmp, board, need, ask, includeRack = true)
+        val reading = letters.read(bmp, board, need, ask, includeRack = true, relaxBoard = true)
         for (p in need) reading.letters[p]?.let { letterCache[p] = it }
 
         return LetterResult(
@@ -171,7 +171,8 @@ class GameController(apiKey: String, ctx: Context) {
         val filled = board.cellsOf(CellKind.FILLED)
         val need = filled.filter { it !in letterCache }
         progress("Harfler okunuyor…")
-        val reading = letters.read(bmp, board, need, ask, includeRack = false)
+        // Öğrenirken sıkı eşleşme: yanlış harften yanlış kelime kaydedilmesin.
+        val reading = letters.read(bmp, board, need, ask, includeRack = false, relaxBoard = false)
         for (p in need) reading.letters[p]?.let { letterCache[p] = it }
 
         val known = HashMap<CellPos, Char>()
@@ -212,14 +213,15 @@ class GameController(apiKey: String, ctx: Context) {
         val st = GameState(board)
         val filled = board.cellsOf(CellKind.FILLED)
         val need = filled.filter { it !in letterCache }
-        val reading = letters.read(bmp, board, need, null, includeRack = true)   // null: kullanıcıya sorma
+        val reading = letters.read(bmp, board, need, null, includeRack = true, relaxBoard = true)   // null: kullanıcıya sorma
         for (p in need) reading.letters[p]?.let { letterCache[p] = it }
         for (p in filled) letterCache[p]?.let { st.known[p] = it }
 
-        if (letters.lastUnresolvedRack > 0)
-            error("Raftaki ${letters.lastUnresolvedRack} harf tanınamadı. 'Harfleri tanı' butonuna bas, sonra Analiz.\n[${letters.lastRackInfo}]")
+        // Raf tamamen okunamadıysa plan yapılamaz. Bir kısmı okunduysa kalan harflerle devam edilir
+        // ("Harfleri tanı" butonuna basmak zorunlu değil).
         if (reading.rack.isEmpty())
-            error("Raftaki harfler okunamadı. 'Harfleri tanı' butonuna bas, sonra Analiz.\n[${letters.lastRackInfo}]")
+            error("Raftaki harfler okunamadı.\n[${letters.lastRackInfo}]")
+        val rackUnread = letters.lastUnresolvedRack
 
         val deadline = System.currentTimeMillis() + AI_TIME_LIMIT_MS
 
@@ -295,6 +297,10 @@ class GameController(apiKey: String, ctx: Context) {
         // Ekranda gösterilecek kısa not: sadece işe yarar şeyler.
         val note = buildString {
             if (turns.endgame) append(turns.label)
+            if (rackUnread > 0) {
+                if (isNotEmpty()) append("\n")
+                append("Rafta $rackUnread karo okunamadı, kalan ${reading.rack.size} harfle planlandı.")
+            }
             if (!turns.endgame && st.inEndgame()) append("Boş hücre azaldı: 'Son4' butonlarından birine bas.")
             if (turns.endgame && !turns.nextIsMine && !turns.finished) append(" (rakibin hamlesini bekle)")
             if (tdkHits > 0) {
