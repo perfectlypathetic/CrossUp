@@ -1,6 +1,7 @@
 package com.example.crossup
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
@@ -17,6 +18,8 @@ import com.example.crossup.service.CaptureService
 class MainActivity : Activity() {
     private lateinit var keyBox: EditText
     private lateinit var info: TextView
+    private lateinit var updInfo: TextView
+    @Volatile private var updating = false
 
     private companion object {
         const val REQ_PROJECTION = 100
@@ -43,6 +46,15 @@ class MainActivity : Activity() {
         } }
 
         info = TextView(this).apply { textSize = 14f; setPadding(0, 40, 0, 10) }
+
+        updInfo = TextView(this).apply {
+            textSize = 14f; setPadding(0, 10, 0, 10)
+            text = "Sürüm: v${BuildConfig.BUILD_NUMBER}"
+        }
+        val updBtn = Button(this).apply {
+            text = "Güncellemeyi kontrol et"
+            setOnClickListener { checkUpdate() }
+        }
 
         val cloudNew = Button(this).apply {
             text = "Bulut: yeni dosya oluştur (ilk cihaz)"
@@ -116,11 +128,67 @@ class MainActivity : Activity() {
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40)
                 addView(keyBox); addView(go); addView(info)
+                addView(updInfo); addView(updBtn)
                 addView(tdkPick)
                 addView(cloudNew); addView(cloudPick); addView(cloudOff)
                 addView(export); addView(import)
             })
         })
+
+        checkUpdate()   // uygulama açılınca GitHub'da yeni sürüm var mı bak
+    }
+
+    // ---------- Otomatik güncelleme (GitHub Releases) ----------
+
+    private fun checkUpdate() {
+        if (updating) return
+        updInfo.text = "Güncelleme kontrol ediliyor…"
+        Thread {
+            val result = runCatching { Updater.latest() }
+            runOnUiThread {
+                if (isFinishing) return@runOnUiThread
+                val rel = result.getOrNull()
+                if (rel == null) {
+                    updInfo.text = "Güncelleme kontrolü başarısız: ${result.exceptionOrNull()?.message}"
+                } else if (rel.isNewer) {
+                    updInfo.text = "Yeni sürüm var: ${rel.tag} (şu an: v${BuildConfig.BUILD_NUMBER})"
+                    askUpdate(rel)
+                } else {
+                    updInfo.text = "Uygulama güncel (v${BuildConfig.BUILD_NUMBER})"
+                }
+            }
+        }.start()
+    }
+
+    private fun askUpdate(rel: Updater.Release) {
+        AlertDialog.Builder(this)
+            .setTitle("Yeni sürüm: ${rel.tag}")
+            .setMessage("Şu anki sürüm: v${BuildConfig.BUILD_NUMBER}\n\n${rel.notes}\n\nŞimdi güncellensin mi?")
+            .setPositiveButton("Güncelle") { _, _ -> startUpdate(rel) }
+            .setNegativeButton("Sonra", null)
+            .show()
+    }
+
+    private fun startUpdate(rel: Updater.Release) {
+        if (!packageManager.canRequestPackageInstalls()) {
+            startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+            Toast.makeText(this, "Bu uygulamaya \"bilinmeyen uygulamaları yükle\" iznini ver, sonra tekrar Güncelle'ye bas", Toast.LENGTH_LONG).show()
+            return
+        }
+        updating = true
+        Thread {
+            try {
+                val apk = Updater.download(this, rel) { p ->
+                    runOnUiThread { updInfo.text = "İndiriliyor… %$p" }
+                }
+                runOnUiThread { updInfo.text = "Yükleme ekranı açılıyor…" }
+                Updater.install(this, apk)
+            } catch (e: Exception) {
+                runOnUiThread { updInfo.text = "Güncelleme hatası: ${e.message}" }
+            } finally {
+                updating = false
+            }
+        }.start()
     }
 
     override fun onResume() {
