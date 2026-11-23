@@ -95,10 +95,14 @@ class GameController(apiKey: String, ctx: Context) {
 
     private var signature = ""
     private val letterCache = HashMap<CellPos, Char>()
+    // NOT: Aşağıdaki üç önbellek yuva konumuna değil, İPUCU GÖRÜNTÜSÜNÜN parmak izine göre tutulur.
+    // Izgara okuması bir an şaşsa / yeni oyun başlasa bile aynı ipucu bir daha sorulmaz / okunmaz.
     private val candCache = ConcurrentHashMap<String, List<Candidate>>()
-    /** İpucu görüntüsünden okunan yazı (OCR). Oyun boyunca bir kez okunur; boş = yazı yok / resimli. */
+    /** İpucu görüntüsünden okunan yazı (OCR). Sadece DOLU sonuçlar kalıcı tutulur. */
     private val ocrCache = ConcurrentHashMap<String, String>()
-    /** AI'a bir kez sorulmuş yuvalar. Oyun boyunca tekrar sorulmaz. */
+    /** OCR'ın yazı bulamadığı (resimli) ipuçları; sadece bu oyun için, yeni oyunda sıfırlanır. */
+    private val ocrEmpty: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    /** AI'a bir kez sorulmuş ipuçları (görüntü parmak izi + uzunluk). */
     private val asked: MutableSet<String> = ConcurrentHashMap.newKeySet()
     /** Son AI hatası (sadece "hata oldu mu" bilgisi için). */
     @Volatile private var lastAiError = ""
@@ -112,11 +116,19 @@ class GameController(apiKey: String, ctx: Context) {
 
     private fun slotKey(s: WordSlot) = "${s.dir}${s.clueCell.r},${s.clueCell.c}:${s.length}"
 
+    /** Önbellek anahtarı: ipucu görüntüsünün parmak izi + cevap uzunluğu. */
+    private fun clueId(ckey: String, length: Int) = "$ckey#$length"
+
+    /** Tahtayı okumadan önce night light / ekran filtresini geri alır (filtre yoksa aynen döner). */
+    private fun prep(bmp: Bitmap): Bitmap = bmp.normalizeTint()
+
     /** Yeni oyun mu? İpucu hücrelerinin düzeni değiştiyse her şeyi sıfırla. */
     private fun syncSignature(board: ParsedBoard) {
         val sig = board.slots.joinToString("|") { slotKey(it) }
         if (sig != signature) {
-            signature = sig; letterCache.clear(); candCache.clear(); ocrCache.clear(); asked.clear(); turns.reset()
+            // Harfler konuma bağlı olduğu için yeni düzende sıfırlanır. İpucu önbellekleri
+            // (görüntüye bağlı) silinmez; sadece "yazı yok" listesi temizlenir.
+            signature = sig; letterCache.clear(); ocrEmpty.clear(); turns.reset()
         }
     }
 
@@ -124,7 +136,8 @@ class GameController(apiKey: String, ctx: Context) {
      * HARFLERİ TANI: Sadece harf okur (raf + tahta). Tanıyamadıklarını kullanıcıya sorar.
      * AI kullanmaz, plan çıkarmaz.
      */
-    suspend fun recognizeLetters(bmp: Bitmap, ask: AskLetter?, progress: (String) -> Unit = {}): LetterResult {
+    suspend fun recognizeLetters(rawBmp: Bitmap, ask: AskLetter?, progress: (String) -> Unit = {}): LetterResult {
+        val bmp = prep(rawBmp)
         progress("Izgara aranıyor…")
         val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
         syncSignature(board)
@@ -149,7 +162,8 @@ class GameController(apiKey: String, ctx: Context) {
      * ÖĞREN: Analiz yapmaz, plan çıkarmaz, ipucu çözdürmez, rafı okumaz.
      * Sadece tahtadaki harfleri okur ve tamamen dolu yuvaları veritabanına kaydeder.
      */
-    suspend fun learn(bmp: Bitmap, ask: AskLetter?, progress: (String) -> Unit = {}): LearnResult {
+    suspend fun learn(rawBmp: Bitmap, ask: AskLetter?, progress: (String) -> Unit = {}): LearnResult {
+        val bmp = prep(rawBmp)
         progress("Izgara aranıyor…")
         val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
         syncSignature(board)
@@ -183,7 +197,8 @@ class GameController(apiKey: String, ctx: Context) {
      * İpuçları: önce bellek, telefondaki veritabanı ve TDK sözlüğü.
      * USE_AI açıksa kalanlar TEK TOPLU istekle AI'a sorulur; kapalıysa çözümsüz kalır.
      */
-    suspend fun analyze(bmp: Bitmap, progress: (String) -> Unit = {}): Analysis {
+    suspend fun analyze(rawBmp: Bitmap, progress: (String) -> Unit = {}): Analysis {
+        val bmp = prep(rawBmp)
         progress("Izgara aranıyor…")
         val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
         progress("Harfler okunuyor…")
@@ -229,10 +244,11 @@ class GameController(apiKey: String, ctx: Context) {
         val results = HashMap<WordSlot, List<Candidate>>()
         val pending = ArrayList<Pending>()
         for (s in todo) {
-            val key = slotKey(s)
             val pattern = s.cells.map { st.known[it] ?: '?' }.joinToString("")
             val crop = bmp.crop(s.clueRect)
-            val local = localCands(s, key, pattern, crop)
+            val ckey = db.key(crop)                 // ipucu görüntüsünün parmak izi (bir kez hesaplanır)
+            val key = clueId(ckey, s.length)
+            val local = localCands(s, key, ckey, pattern, crop)
             if (local != null) results[s] = local else pending.add(Pending(s, key, pattern, crop))
         }
         if (tdkHits > 0) progress("TDK ile $tdkHits ipucu çözüldü, ${pending.size} ipucu kaldı")
@@ -309,7 +325,7 @@ class GameController(apiKey: String, ctx: Context) {
      * AI'sız çözüm: 1) bellek  2) telefondaki veritabanı  3) TDK sözlüğü.
      * Liste dönerse yuva çözülmüştür (boş olabilir). null dönerse AI'a sorulmalıdır.
      */
-    private suspend fun localCands(s: WordSlot, key: String, pattern: String, crop: Bitmap): List<Candidate>? {
+    private suspend fun localCands(s: WordSlot, key: String, ckey: String, pattern: String, crop: Bitmap): List<Candidate>? {
         fun fits(w: String) = w.indices.all { pattern[it] == '?' || pattern[it] == w[it] }
 
         // 1) Bellek: kayıtlı adaylar, tahtadaki yeni harflere göre elenir.
@@ -319,7 +335,7 @@ class GameController(apiKey: String, ctx: Context) {
         }
 
         // 2) Telefondaki veritabanı
-        val hit = db.get(db.key(crop), s.length).filter { fits(it) }
+        val hit = db.get(ckey, s.length).filter { fits(it) }
         if (hit.isNotEmpty()) {
             if (DEBUG_TDK) tdkDebug.add("${s.length}h → kayıtlı veritabanından: ${hit.take(3).joinToString(",")}")
             return hit.map { Candidate(it, 1.0) }.also { candCache[key] = it }
@@ -328,10 +344,10 @@ class GameController(apiKey: String, ctx: Context) {
         // 3) TDK sözlüğü: ipucu yazısı bir kez okunur (OCR), her seferinde güncel desenle aranır.
         //    Güven düşükse / resimli ipucuysa null döner.
         if (tdk.ready && key !in asked) {
-            var text = ocrCache[key]
+            var text = ocrCache[ckey]
             if (text == null) {
-                text = tdk.readClue(crop)
-                ocrCache[key] = text
+                text = if (ckey in ocrEmpty) "" else tdk.readClue(crop)
+                if (text.isEmpty()) ocrEmpty.add(ckey) else ocrCache[ckey] = text
             }
             val t = tdk.candidates(text, s.length, pattern)
             if (DEBUG_TDK) tdkDebug.add("${s.length}h \"${text.take(40)}\" → ${tdk.lastReason}")
