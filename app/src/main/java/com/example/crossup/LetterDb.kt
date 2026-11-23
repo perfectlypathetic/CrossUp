@@ -132,7 +132,7 @@ class LetterDb private constructor(ctx: Context) {
 
     /** Eşleşen harfi döner; emin değilse null. */
     @Synchronized
-    fun match(fp: Fp): Char? {
+    fun match(fp: Fp, maxDist: Int = MAX_DIST, margin: Int = MARGIN): Char? {
         if (list.isEmpty()) return null
         val per = HashMap<Char, Int>()
         for (t in list) {
@@ -143,8 +143,29 @@ class LetterDb private constructor(ctx: Context) {
         val sorted = per.entries.sortedBy { it.value }
         val best = sorted[0]
         val second = sorted.getOrNull(1)?.value ?: Int.MAX_VALUE
-        return if (best.value <= MAX_DIST && second - best.value >= MARGIN) best.key else null
+        return if (best.value <= maxDist && second - best.value >= margin) best.key else null
     }
+
+    /** Biraz gevşek eşleşme (tahtadaki harfler için): eşik ve fark şartı daha esnek. */
+    fun matchRelaxed(fp: Fp): Char? = match(fp, 40, 3)
+
+    /**
+     * En yakın şablonun harfi. Fark şartı yok; sadece mesafe sınırı var.
+     * Raf karoları her zaman harftir, bu yüzden raf için kullanılır.
+     */
+    @Synchronized
+    fun nearest(fp: Fp, maxDist: Int): Char? {
+        var bestCh: Char? = null
+        var best = Int.MAX_VALUE
+        for (t in list) {
+            val d = dist(fp, t.fp)
+            if (d < best) { best = d; bestCh = t.ch }
+        }
+        return if (bestCh != null && best <= maxDist) bestCh else null
+    }
+
+    /** 29 harfin hepsi kayıtlı mı? (Öyleyse artık kullanıcıya harf sorulmaz.) */
+    fun isComplete(): Boolean = hasAll(TR_ALPHABET)
 
     /** Verilen alfabenin TÜM harfleri için en az bir şablon kayıtlı mı? */
     @Synchronized
