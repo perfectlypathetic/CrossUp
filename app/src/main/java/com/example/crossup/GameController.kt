@@ -127,6 +127,25 @@ class GameController(apiKey: String, ctx: Context) {
     private var prevPlan: Plan? = null
     private var lastSlotKeys: Set<String> = emptySet()
 
+    // ---------- Rakibin eli takibi ----------
+    // KURAL: oynayan kişiye harfler hemen tamamlanmaz. Rakip oynadıktan sonra elinde (6 - oynadığı)
+    // harf KALIR; sırası tekrar gelince eksikler torbadan rastgele verilir.
+    /** Rakibin son turda tahtaya koyduğu harf sayısı. -1 = bilinmiyor (ilk analiz). */
+    private var oppLastPlayed = -1
+    /** Kullanıcının "Rkp değiştirdi" tuşuyla bildirdiği, bir sonraki Analiz'de kullanılacak sayı. */
+    private var oppSwapPending = 0
+    /** Son turda rakibin değiştirdiği harf sayısı (Analiz'de uygulanmış hali). */
+    private var oppSwapApplied = 0
+    /** Bu analizde yeni bir tur algılandı mı (tahtaya harf eklendi veya raf değişti). */
+    private var turnChanged = false
+
+    /** Rakip son turunda harf değiştirdiyse (tahtada görünmez) her basışta +1; 6'dan sonra sıfırlanır. */
+    fun addOppSwap(): String {
+        oppSwapPending = if (oppSwapPending >= 6) 0 else oppSwapPending + 1
+        return if (oppSwapPending == 0) "Rakip harf değiştirmedi olarak işaretlendi."
+        else "Rakip son turda $oppSwapPending harf değiştirdi. (Şimdi Analiz'e bas.)"
+    }
+
     fun scoreLabel(): String = "Skor: ben $myScore – rakip $oppScore"
 
     /** Elle skor düzeltme (rakibin yanlış harfleri gibi görünmeyen şeyler için). */
@@ -139,6 +158,7 @@ class GameController(apiKey: String, ctx: Context) {
     fun resetGame(): String {
         myScore = 0; oppScore = 0
         prevFilled = null; prevPlan = null; prevRack = ""
+        oppLastPlayed = -1; oppSwapPending = 0; oppSwapApplied = 0
         turns.reset()
         return "Sıfırlandı. " + scoreLabel()
     }
@@ -154,6 +174,7 @@ class GameController(apiKey: String, ctx: Context) {
         val oldPlan = prevPlan
         val rackNow = rack.sorted().joinToString("")
         var msg = ""
+        turnChanged = false
         if (pf != null) {
             val newCells = filledNow.filter { it !in pf }
             if (newCells.isNotEmpty()) {
@@ -189,6 +210,12 @@ class GameController(apiKey: String, ctx: Context) {
                 myScore += dMine
                 oppScore += dOpp
                 msg = "son hamleler: ben +$dMine, rakip +$dOpp"
+                oppLastPlayed = opp.size       // rakibin elinde kalan harf = 6 - bu sayı
+                turnChanged = true
+            } else if (prevRack.isNotEmpty() && rackNow != prevRack) {
+                // Tahtaya yeni harf gelmedi ama rafım değişti: yeni tur, rakip harf koymadı (pas/değiştirme).
+                oppLastPlayed = 0
+                turnChanged = true
             }
         }
         prevFilled = filledNow
@@ -224,6 +251,7 @@ class GameController(apiKey: String, ctx: Context) {
                 turns.reset()
                 myScore = 0; oppScore = 0
                 prevFilled = null; prevPlan = null; prevRack = ""
+                oppLastPlayed = -1; oppSwapPending = 0; oppSwapApplied = 0
             }
         }
     }
@@ -325,6 +353,8 @@ class GameController(apiKey: String, ctx: Context) {
 
         // Skor takibi: önceki analizden bu yana tahtaya eklenenler.
         val scoreMsg = trackScores(board, st, reading.rack)
+        if (oppSwapPending > 0) { oppSwapApplied = oppSwapPending; oppSwapPending = 0 }
+        else if (turnChanged) oppSwapApplied = 0
         st.myScore = myScore
         st.oppScore = oppScore
 
@@ -392,17 +422,32 @@ class GameController(apiKey: String, ctx: Context) {
         for ((s, c) in results) st.cands[s] = c
 
         progress("Hamle planlanıyor…")
-        // Torba / rakip rafı tahmini: oyunda toplam harf sayısı = boş hücre sayısı.
+        // Torba / rakip eli tahmini. Oyunda toplam harf sayısı = boş hücre sayısı.
+        // Rakibin eli: son turda oynamadığı harfler (6 - oynadığı - değiştirdiği); sırası gelince
+        // eksikleri torbadan rastgele çeker. Torba = benim dışımdaki harfler - rakibin eli.
         val emptyCount = st.emptyCells().size
         val myTiles = reading.rack.size + rackUnread
-        val oppRack = if (myTiles < 6) maxOf(0, emptyCount - myTiles) else minOf(6, maxOf(0, emptyCount - myTiles))
-        val pool = if (myTiles < 6) 0 else maxOf(0, emptyCount - myTiles - oppRack)
+        val rest = maxOf(0, emptyCount - myTiles)                  // rakip eli + torba
+        val histKnown = oppLastPlayed >= 0 || oppSwapApplied > 0
+        val heldEst = if (histKnown) (6 - maxOf(0, oppLastPlayed) - oppSwapApplied).coerceIn(0, 6) else 0
+        val oppHeld: Int       // rakibin şu an elinde tuttuğu harf sayısı
+        val pool: Int          // torbada kalan harf sayısı
+        if (myTiles < 6) {
+            // Rafım dolmadıysa torba bitmiştir; kalan her harf rakipte.
+            oppHeld = minOf(6, rest); pool = 0
+        } else if (histKnown) {
+            oppHeld = minOf(heldEst, rest); pool = rest - oppHeld
+        } else {
+            // Geçmiş bilinmiyor (ilk analiz): eski varsayım, rakip eli dolu sayılır.
+            oppHeld = 0; pool = maxOf(0, rest - 6)
+        }
+        val oppFresh = minOf(6 - oppHeld, pool)                    // rakibin sırası gelince çekeceği yeni harf
 
         val ctx = if (turns.endgame)
             TurnContext(true, turns.myTurnsLeft.coerceAtLeast(1), turns.oppAfterNextMine,
-                myScore, oppScore, pool, oppRack, turns.seqFromMyNext)
+                myScore, oppScore, pool, 6, turns.seqFromMyNext, oppHeld)
         else
-            TurnContext(false, 99, 1, myScore, oppScore, pool, oppRack, emptyList())
+            TurnContext(false, 99, 1, myScore, oppScore, pool, 6, emptyList(), oppHeld)
 
         val plan = Planner(st).plan(reading.rack, ctx)
         prevPlan = plan
@@ -413,7 +458,13 @@ class GameController(apiKey: String, ctx: Context) {
         val note = buildString {
             append(scoreLabel())
             if (scoreMsg.isNotEmpty()) append(" ($scoreMsg)")
-            append("\nBoş hücre: $emptyCount · torba ≈ $pool · rakip rafı ≈ $oppRack")
+            append("\nBoş hücre: $emptyCount · torba ≈ $pool")
+            if (histKnown || myTiles < 6) {
+                append(" · rakip elinde ≈ $oppHeld harf tutuyor, sırası gelince ≈ $oppFresh yeni harf çeker")
+                if (oppSwapApplied > 0) append(" (rakip $oppSwapApplied harf değiştirmiş)")
+            } else {
+                append(" · rakip eli bilinmiyor (ilk analiz; bir sonraki turdan itibaren takip edilir)")
+            }
             if (turns.endgame) append("\n").append(turns.label)
             if (rackUnread > 0) {
                 if (isNotEmpty()) append("\n")
