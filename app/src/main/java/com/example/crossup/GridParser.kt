@@ -2,6 +2,7 @@ package com.example.crossup.parser
 
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import com.example.crossup.GameLog
 
 /*
  * Cross-Up ızgara okuyucu (saf Kotlin, Android'e bağımlı değil).
@@ -61,9 +62,11 @@ class ParserConfig(
 )
 
 class GridParser(private val cfg: ParserConfig = ParserConfig()) {
+    private val GP = "GridParser"
 
     /** Izgara bulunamazsa null döner (ör. oyun ekranı açık değil). */
     fun parse(src: PixelSource): ParsedBoard? {
+        GameLog.d(GP, "parse başladı: ekran ${src.width}x${src.height}")
         // 1) Üst satır: genişliğin en az %30'u yeşil olan ilk satır (köşede resim olsa da bulunur).
         var top = -1
         for (y in 0 until src.height) {
@@ -72,7 +75,10 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
             while (x < src.width) { if (isGreen(src.rgb(x, y))) g++; x += 3 }
             if (g * 10 > src.width) { top = y; break }
         }
-        if (top < 0) return null
+        if (top < 0) {
+            GameLog.w(GP, "Izgara YOK: ekranda ipucu yeşili içeren satır bulunamadı (ekran ${src.width}x${src.height})")
+            return null
+        }
 
         // 2) Sol/sağ/alt sınır: üstten aşağı, yeşil görülen her yeri tara; uzun bir boşlukta dur.
         var minX = Int.MAX_VALUE
@@ -102,19 +108,29 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
             } else if (yy - lastGreen > gap) break
             yy += 2
         }
-        if (maxX < 0) return null
+        if (maxX < 0) {
+            GameLog.w(GP, "Izgara YOK: yeşil sınır bulunamadı (üst=$top)")
+            return null
+        }
 
         val left = minX
         val expectedRight = src.width - left          // ızgara ekranda ortalı
         var right = maxX + 1
         if (right < expectedRight - 8) right = expectedRight   // sağ köşe resimliydi, yeşil görünmedi
         val cw = (right - left) / cfg.cols.toDouble()
-        if (cw < 20) return null
+        if (cw < 20) {
+            GameLog.w(GP, "Izgara YOK: hücre genişliği çok küçük cw=${GameLog.f(cw)} (sol=$left sağ=$right)")
+            return null
+        }
 
         val bottom = lastGreen + 2
         val rows = ((bottom - top) / cw).roundToInt()
-        if (rows < 2) return null
+        if (rows < 2) {
+            GameLog.w(GP, "Izgara YOK: satır sayısı çok az rows=$rows (üst=$top alt=$bottom cw=${GameLog.f(cw)})")
+            return null
+        }
         val ch = cw                                    // hücreler kare
+        GameLog.i(GP, "ızgara sınırları: üst=$top sol=$left sağ=$right (beklenen sağ=$expectedRight, yeşilden bulunan sağ=${maxX + 1}) alt=$bottom hücre=${GameLog.f(cw)}px satır=$rows sütun=${cfg.cols}")
 
         fun rect(r: Int, c: Int) = Rect(
             (left + c * cw).roundToInt(), (top + r * ch).roundToInt(),
@@ -148,7 +164,10 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
             val hasDown = downOpen && isArrowSize(downArrowCols(src, rc), w) &&
                 (busy || downArrowTapers(src, rc))
 
-            if (hasRight || hasDown) kinds[r][c] = CellKind.CLUE
+            if (hasRight || hasDown) {
+                kinds[r][c] = CellKind.CLUE
+                GameLog.d(GP, "resimli ipucu hücresi bulundu: (${r + 1},${c + 1}) sağOk=$hasRight aşağıOk=$hasDown halka-resimli=$busy")
+            }
         }
 
         // 4) Oklar ve kelime yuvaları.
@@ -161,6 +180,7 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
             val downOpen = r + 1 < rows && kinds[r + 1][c] != CellKind.CLUE
             val ratioRight = if (rightOpen) rightArrowRatio(src, rc) else null
             val ratioDown = if (downOpen) downArrowPresent(src, rc) else false
+            GameLog.d(GP, "ipucu hücresi (${r + 1},${c + 1}): sağAçık=$rightOpen sağOkOranı=${if (ratioRight == null) "yok" else GameLog.f(ratioRight)} aşağıAçık=$downOpen aşağıOk=$ratioDown")
 
             // İki ipucu üst üste mi? Sağ okun yüksekliğinden anlaşılır.
             val (acrossRect, downRect) = when {
@@ -182,7 +202,9 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
                 if (cells.isNotEmpty()) slots.add(WordSlot(Dir.DOWN, CellPos(r, c), downRect, cells))
             }
         }
-        return ParsedBoard(rows, cfg.cols, kinds, rects, slots)
+        val pb = ParsedBoard(rows, cfg.cols, kinds, rects, slots)
+        GameLog.i(GP, "Izgara okundu: $rows satır x ${cfg.cols} sütun, ${slots.size} yuva\n" + pb.dump() + "\n" + pb.describeSlots())
+        return pb
     }
 
     // ---- hücre sınıflandırma ----
@@ -339,3 +361,33 @@ class GridParser(private val cfg: ParserConfig = ParserConfig()) {
         abs(((p shr 8) and 0xFF) - ((ref shr 8) and 0xFF)) +
         abs((p and 0xFF) - (ref and 0xFF)) < tol
 }
+
+/**
+ * Tahtayı yazı olarak çizer (log için). 1 tabanlı satır/sütun.
+ * [#] = ipucu hücresi, " . " = boş, harf = dolu hücre (? = dolu ama harfi bilinmiyor).
+ */
+fun ParsedBoard.dump(letters: Map<CellPos, Char>? = null): String {
+    val sb = StringBuilder()
+    sb.append("    ")
+    for (c in 0 until cols) sb.append(" ").append(c + 1).append(" ")
+    for (r in 0 until rows) {
+        sb.append("\n").append("r${r + 1}".padEnd(4))
+        for (c in 0 until cols) {
+            when (kinds[r][c]) {
+                CellKind.CLUE -> sb.append("[#]")
+                CellKind.EMPTY -> sb.append(" . ")
+                CellKind.FILLED -> sb.append(" ").append(letters?.get(CellPos(r, c)) ?: '?').append(" ")
+            }
+        }
+    }
+    return sb.toString()
+}
+
+/** Yuvaların listesi (log için). */
+fun ParsedBoard.describeSlots(): String =
+    slots.joinToString("\n") { s ->
+        val dir = if (s.dir == Dir.ACROSS) "→" else "↓"
+        val first = s.cells.first()
+        val last = s.cells.last()
+        "yuva ipucu(${s.clueCell.r + 1},${s.clueCell.c + 1}) $dir uzunluk=${s.length} hücreler=(${first.r + 1},${first.c + 1})..(${last.r + 1},${last.c + 1}) ipucuKutusu=[${s.clueRect.x0},${s.clueRect.y0}-${s.clueRect.x1},${s.clueRect.y1}]"
+    }
