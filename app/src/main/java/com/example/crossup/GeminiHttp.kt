@@ -2,6 +2,7 @@ package com.example.crossup.ai
 
 import android.util.Base64
 import android.util.Log
+import com.example.crossup.GameLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -68,7 +69,10 @@ object GeminiHttp {
         readTimeoutMs: Int = 15_000
     ): String = withContext(Dispatchers.IO) {
         var last = "bilinmiyor"
-        for (model in order(chain).take(MAX_TRIES)) {
+        val tried = order(chain).take(MAX_TRIES)
+        GameLog.i(TAG, "AI isteği: modeller=${tried.joinToString(",")} parça=${parts.size} (resim=${parts.count { it is ReqPart.Image }}) maxToken=$maxTokens zamanAşımı=${readTimeoutMs}ms")
+        for (model in tried) {
+            val t0 = System.currentTimeMillis()
             try {
                 val out = try {
                     call(apiKey, model, parts, maxTokens, plain = model.startsWith("gemma"), readTimeoutMs = readTimeoutMs)
@@ -78,10 +82,12 @@ object GeminiHttp {
                     else throw e
                 }
                 lastModel = model
+                GameLog.i(TAG, "AI cevabı: model=$model ${System.currentTimeMillis() - t0}ms uzunluk=${out.length} içerik=${out.take(400)}")
                 return@withContext out
             } catch (e: ApiError) {
                 last = "$model: HTTP ${e.code} ${e.message}"
                 Log.w(TAG, last)
+                GameLog.w(TAG, last + " (${System.currentTimeMillis() - t0}ms)")
                 if (isKeyError(e) || e.code == 401 || e.code == 403) throw e      // anahtar sorunu: model değiştirmek çare değil
                 when (e.code) {
                     429 -> ban(model, 60_000)                  // kota: 1 dk dinlendir
@@ -92,12 +98,15 @@ object GeminiHttp {
             } catch (e: IOException) {                         // zaman aşımı / ağ
                 last = "$model: ${e.message}"
                 Log.w(TAG, last)
+                GameLog.w(TAG, last + " (${System.currentTimeMillis() - t0}ms)")
                 ban(model, 20_000)
             } catch (e: Exception) {                           // JSON parse / boş cevap
                 last = "$model: ${e.message}"
                 Log.w(TAG, last)
+                GameLog.w(TAG, last + " (${System.currentTimeMillis() - t0}ms)")
             }
         }
+        GameLog.e(TAG, "AI: tüm modeller başarısız. Son hata: ${last.take(200)}")
         error("Tüm modeller başarısız oldu. Son hata: ${last.take(200)}")
     }
 
