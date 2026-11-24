@@ -23,8 +23,6 @@ class MainActivity : Activity() {
 
     private companion object {
         const val REQ_PROJECTION = 100
-        const val REQ_EXPORT = 101
-        const val REQ_IMPORT = 102
         const val REQ_CLOUD_NEW = 103
         const val REQ_CLOUD_PICK = 104
         const val REQ_TDK = 105
@@ -83,11 +81,6 @@ class MainActivity : Activity() {
                 )
             }
         }
-        val cloudOff = Button(this).apply {
-            text = "Bulut bağlantısını kes"
-            setOnClickListener { CloudSync.disconnect(this@MainActivity); refreshInfo() }
-        }
-
         val tdkPick = Button(this).apply {
             text = "TDK sözlüğünü dosyadan yükle (tdk.txt)"
             setOnClickListener {
@@ -100,38 +93,13 @@ class MainActivity : Activity() {
             }
         }
 
-        val export = Button(this).apply {
-            text = "Verileri dışa aktar (elle yedek)"
-            setOnClickListener {
-                startActivityForResult(
-                    Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-                        addCategory(Intent.CATEGORY_OPENABLE)
-                        type = "application/json"
-                        putExtra(Intent.EXTRA_TITLE, "crossup_yedek.json")
-                    }, REQ_EXPORT
-                )
-            }
-        }
-        val import = Button(this).apply {
-            text = "Verileri içe aktar (elle yedekten)"
-            setOnClickListener {
-                startActivityForResult(
-                    Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                        addCategory(Intent.CATEGORY_OPENABLE)
-                        type = "*/*"
-                    }, REQ_IMPORT
-                )
-            }
-        }
-
         setContentView(ScrollView(this).apply {
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40)
                 addView(keyBox); addView(go); addView(info)
                 addView(updInfo); addView(updBtn)
                 addView(tdkPick)
-                addView(cloudNew); addView(cloudPick); addView(cloudOff)
-                addView(export); addView(import)
+                addView(cloudNew); addView(cloudPick)
             })
         })
 
@@ -259,29 +227,6 @@ class MainActivity : Activity() {
                         contentResolver.openInputStream(uri)!!.use { TdkDb.get(this@MainActivity).installFrom(it) }
                     } catch (e: Exception) { false }
                     val msg = if (ok) "TDK sözlüğü yüklendi." else "TDK yüklenemedi: " + TdkDb.get(this@MainActivity).lastError
-                    runOnUiThread {
-                        Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
-                        refreshInfo()
-                    }
-                }.start()
-            }
-            REQ_EXPORT -> {
-                val uri = data.data ?: return
-                Thread {
-                    val msg = try {
-                        contentResolver.openOutputStream(uri, "wt")!!.use { CloudSync.exportTo(this@MainActivity, it) }
-                        "Yedek kaydedildi."
-                    } catch (e: Exception) { "Hata: ${e.message}" }
-                    runOnUiThread { Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show() }
-                }.start()
-            }
-            REQ_IMPORT -> {
-                val uri = data.data ?: return
-                Thread {
-                    val msg = try {
-                        val added = contentResolver.openInputStream(uri)!!.use { CloudSync.importFrom(this@MainActivity, it) }
-                        "$added yeni kayıt eklendi."
-                    } catch (e: Exception) { "Okunamadı: ${e.message}" }
                     runOnUiThread {
                         Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
                         refreshInfo()
