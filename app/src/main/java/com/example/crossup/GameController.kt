@@ -95,6 +95,8 @@ class GameController(apiKey: String, ctx: Context) {
 
     private var signature = ""
     private val letterCache = HashMap<CellPos, Char>()
+    /** Harfi GEVŞEK eşleşmeyle okunmuş (emin olunmayan) hücreler: bunlardan kelime öğrenilmez. */
+    private val relaxedCells = HashSet<CellPos>()
     // NOT: Aşağıdaki üç önbellek yuva konumuna değil, İPUCU GÖRÜNTÜSÜNÜN parmak izine göre tutulur.
     // Izgara okuması bir an şaşsa / yeni oyun başlasa bile aynı ipucu bir daha sorulmaz / okunmaz.
     private val candCache = ConcurrentHashMap<String, List<Candidate>>()
@@ -128,7 +130,7 @@ class GameController(apiKey: String, ctx: Context) {
         if (sig != signature) {
             // Harfler konuma bağlı olduğu için yeni düzende sıfırlanır. İpucu önbellekleri
             // (görüntüye bağlı) silinmez; sadece "yazı yok" listesi temizlenir.
-            signature = sig; letterCache.clear(); ocrEmpty.clear(); turns.reset()
+            signature = sig; letterCache.clear(); relaxedCells.clear(); ocrEmpty.clear(); turns.reset()
         }
     }
 
@@ -147,6 +149,7 @@ class GameController(apiKey: String, ctx: Context) {
         progress("Harfler okunuyor…")
         val reading = letters.read(bmp, board, need, ask, includeRack = true, relaxBoard = true)
         for (p in need) reading.letters[p]?.let { letterCache[p] = it }
+        relaxedCells.addAll(letters.lastRelaxed)
 
         return LetterResult(
             rack = reading.rack,
@@ -169,6 +172,8 @@ class GameController(apiKey: String, ctx: Context) {
         syncSignature(board)
 
         val filled = board.cellsOf(CellKind.FILLED)
+        // Daha önce gevşek eşleşmeyle okunmuş harfler güvenilmez: öğrenmeden önce sıkı şekilde yeniden okunur.
+        for (p in filled) if (p in relaxedCells) { letterCache.remove(p); relaxedCells.remove(p) }
         val need = filled.filter { it !in letterCache }
         progress("Harfler okunuyor…")
         // Öğrenirken sıkı eşleşme: yanlış harften yanlış kelime kaydedilmesin.
@@ -215,6 +220,7 @@ class GameController(apiKey: String, ctx: Context) {
         val need = filled.filter { it !in letterCache }
         val reading = letters.read(bmp, board, need, null, includeRack = true, relaxBoard = true)   // null: kullanıcıya sorma
         for (p in need) reading.letters[p]?.let { letterCache[p] = it }
+        relaxedCells.addAll(letters.lastRelaxed)
         for (p in filled) letterCache[p]?.let { st.known[p] = it }
 
         // Raf tamamen okunamadıysa plan yapılamaz. Bir kısmı okunduysa kalan harflerle devam edilir
@@ -227,7 +233,8 @@ class GameController(apiKey: String, ctx: Context) {
 
         // ÖĞRENME: tamamen dolmuş yuvaların ipucu görüntüsünü ve cevabını telefona kaydet.
         for (s in board.slots) {
-            if (s.cells.all { it in st.known }) {
+            // Gevşek eşleşmeyle okunmuş (emin olunmayan) harf içeren yuvalardan öğrenme.
+            if (s.cells.all { it in st.known && it !in relaxedCells }) {
                 db.put(db.key(bmp.crop(s.clueRect)), s.cells.map { st.known[it]!! }.joinToString(""))
             }
         }
