@@ -2,6 +2,7 @@ package com.example.crossup.ai
 
 import android.content.Context
 import android.graphics.Bitmap
+import com.example.crossup.GameLog
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -40,6 +41,7 @@ class ClueDb private constructor(ctx: Context) {
         private const val BITS = N * N
         private const val BIG = Int.MAX_VALUE / 4
         private const val BLANK = "BLANK"
+        private const val TAG = "ClueDb"
 
         /** Bu farka kadar (256 bit + en/boy cezası) aynı ipucu sayılır. Ölçüm: aynı ipucu en çok ~16-22, farklı ipuçları en az ~26-30. */
         const val MAX_DIST = 21
@@ -57,6 +59,10 @@ class ClueDb private constructor(ctx: Context) {
             }
 
         private fun isValid(k: String) = k.length > BITS + 1 && k[BITS] == '@'
+
+        /** Log için kısa ipucu kimliği: parmak izinin özeti + en/boy. */
+        fun shortId(k: String): String =
+            if (!isValid(k)) k else Integer.toHexString(k.hashCode()) + "@" + k.substring(BITS + 1)
     }
 
     init {
@@ -78,6 +84,8 @@ class ClueDb private constructor(ctx: Context) {
             }
         }
         if (!ok && bak.exists()) runCatching { map.putAll(parse(bak.readText())) }
+        if (file.exists() && !ok) GameLog.w(TAG, "ana dosya (clues3.json) okunamadı/bozuk, yedeğe bakıldı")
+        GameLog.i(TAG, "yüklendi: ${map.size} ipucu kaydı, ${map.values.sumOf { it.size }} kelime (ana dosya ok=$ok, atlanan eski kayıt=$lastSkipped)")
     }
 
     private fun parse(text: String): HashMap<String, MutableSet<String>> = parseObj(JSONObject(text))
@@ -217,7 +225,10 @@ class ClueDb private constructor(ctx: Context) {
      */
     @Synchronized
     fun get(key: String, length: Int): List<String> {
-        if (!isValid(key)) return emptyList()
+        if (!isValid(key)) {
+            GameLog.d(TAG, "get: anahtar geçersiz/BLANK (uzunluk=$length) → boş")
+            return emptyList()
+        }
         var best: String? = null; var bd = BIG
         var second: String? = null; var sd = BIG
         for (k in map.keys) {
@@ -226,23 +237,43 @@ class ClueDb private constructor(ctx: Context) {
             else if (d < sd) { second = k; sd = d }
         }
         val limit = if (length <= 2) MAX_DIST_SHORT else MAX_DIST
-        val b = best ?: return emptyList()
-        if (bd > limit) return emptyList()
+        val id = shortId(key)
+        val b = best
+        if (b == null) {
+            GameLog.d(TAG, "get $id uzunluk=$length: veritabanı boş → boş")
+            return emptyList()
+        }
+        if (bd > limit) {
+            GameLog.d(TAG, "get $id uzunluk=$length: en yakın kayıt ${shortId(b)} mesafe=$bd > sınır=$limit → bulunamadı")
+            return emptyList()
+        }
         val words = map[b]!!.filter { it.length == length }
-        if (words.isEmpty()) return emptyList()
+        if (words.isEmpty()) {
+            GameLog.d(TAG, "get $id uzunluk=$length: en yakın ${shortId(b)} mesafe=$bd ama bu uzunlukta cevabı yok (kayıtlı: ${map[b]!!.joinToString(",")}) → boş")
+            return emptyList()
+        }
         val s = second
         if (s != null && sd <= limit && sd - bd < AMBIGUOUS_GAP) {
             val other = map[s]!!.filter { it.length == length }
-            if (other.isNotEmpty() && other.toSet() != words.toSet()) return emptyList()
+            if (other.isNotEmpty() && other.toSet() != words.toSet()) {
+                GameLog.w(TAG, "get $id uzunluk=$length: BELİRSİZ en yakın ${shortId(b)}=$bd (${words.joinToString(",")}) ikinci ${shortId(s)}=$sd (${other.joinToString(",")}) → boş")
+                return emptyList()
+            }
         }
+        GameLog.d(TAG, "get $id uzunluk=$length: BULUNDU ${shortId(b)} mesafe=$bd ikinci=${if (s == null) "yok" else sd.toString()} → ${words.joinToString(",")}")
         return words
     }
 
     @Synchronized
     fun put(key: String, word: String) {
         if (!isValid(key) || word.isEmpty()) return
-        val k = nearestKey(key, MERGE_DIST) ?: key
-        if (map.getOrPut(k) { HashSet() }.add(word)) save()
+        val near = nearestKey(key, MERGE_DIST)
+        val k = near ?: key
+        val added = map.getOrPut(k) { HashSet() }.add(word)
+        if (added) {
+            save()
+            GameLog.d(TAG, "put ${shortId(key)} → \"$word\": ${if (near == null) "YENİ ipucu kaydı" else "mevcut kayıt ${shortId(near)} ile birleşti"}, kelime EKLENDİ (toplam kelime=${map.values.sumOf { it.size }})")
+        }
     }
 
     /** Toplam kayıtlı kelime sayısı. */
@@ -264,6 +295,7 @@ class ClueDb private constructor(ctx: Context) {
             for (w in words) if (set.add(w)) added++
         }
         if (added > 0) save()
+        GameLog.i(TAG, "buluttan birleştirme: +$added kelime (toplam ${map.values.sumOf { it.size }}, atlanan eski kayıt=$lastSkipped)")
         return added
     }
 
@@ -291,6 +323,6 @@ class ClueDb private constructor(ctx: Context) {
             tmp.writeText(json)
             if (file.exists()) runCatching { file.copyTo(bak, overwrite = true) }
             if (!tmp.renameTo(file)) file.writeText(json)
-        }
+        }.onFailure { GameLog.e(TAG, "kaydetme hatası", it) }
     }
 }
