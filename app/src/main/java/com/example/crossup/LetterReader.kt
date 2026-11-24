@@ -3,6 +3,7 @@ package com.example.crossup.ai
 import android.content.Context
 import android.graphics.Bitmap
 import com.example.crossup.game.TR
+import com.example.crossup.GameLog
 import com.example.crossup.parser.CellPos
 import com.example.crossup.parser.ParsedBoard
 import com.example.crossup.parser.Rect
@@ -28,6 +29,8 @@ const val TR_ALPHABET = "ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZ"
  * Sadece kullanıcının onayladığı harfler şablon olarak kaydedilir.
  */
 class LetterReader(ctx: Context) {
+    private companion object { const val T = "LetterReader" }
+
     private val db = LetterDb.get(ctx)
     private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
 
@@ -60,6 +63,12 @@ class LetterReader(ctx: Context) {
         var skipped = false
     }
 
+    /** Log için karo adı. */
+    private fun lab(item: Item): String {
+        val c = item.cell
+        return if (c == null) "raf#${item.rackIdx + 1}" else "hücre(${c.r + 1},${c.c + 1})"
+    }
+
     suspend fun read(
         bmp: Bitmap, board: ParsedBoard, need: List<CellPos>,
         ask: AskLetter?, includeRack: Boolean,
@@ -72,17 +81,23 @@ class LetterReader(ctx: Context) {
         val askFn: AskLetter? = if (complete) null else ask
         val items = ArrayList<Item>()
         var rackMissing = 0   // rafta olup okunamayan / hiç bulunamayan karolar
+        GameLog.i(T, "okuma başladı: tahtadan okunacak hücre=${need.size} rafOku=$includeRack gevşekTahta=$relaxBoard kullanıcıyaSorabilir=${ask != null} 29harfTamam=$complete şablon=${db.size()} (${db.counts()})")
 
         if (includeRack) {
             val tiles = locateRack(bmp, board)
             if (tiles.isEmpty()) rackMissing = 1
+            GameLog.i(T, "raf karoları: ${tiles.size} adet " + tiles.joinToString(" ") { "[${it.x0},${it.y0}-${it.x1},${it.y1}]" } + " | $lastRackInfo")
             var noFp = 0
             tiles.forEachIndexed { i, r ->
                 val crop = inner(bmp, r, 0.075)
                 val fp = LetterFp.of(crop)
-                if (fp != null) items.add(Item(i, null, crop, fp)) else { rackMissing++; noFp++ }
+                if (fp != null) items.add(Item(i, null, crop, fp)) else {
+                    rackMissing++; noFp++
+                    GameLog.w(T, "raf#${i + 1} karosundan harf çıkarılamadı (kontrast/leke yok) kutu=[${r.x0},${r.y0}-${r.x1},${r.y1}]")
+                }
             }
             lastRackInfo += "; harfi çıkarılamayan karo=$noFp"
+            GameLog.i(T, "raf arama özeti: $lastRackInfo")
         } else {
             lastRackInfo = ""
         }
@@ -90,10 +105,14 @@ class LetterReader(ctx: Context) {
             val crop = inner(bmp, board.cellRects[p.r][p.c], 0.125)
             val fp = LetterFp.of(crop)
             if (fp != null) items.add(Item(-1, p, crop, fp))
+            else GameLog.w(T, "hücre(${p.r + 1},${p.c + 1}) için parmak izi çıkarılamadı (harf yok / kırpma boş) → atlandı")
         }
 
         // 1) şablon eşleştirme
-        for (item in items) item.ch = db.match(item.fp)
+        for (item in items) {
+            item.ch = db.match(item.fp)
+            GameLog.d(T, "şablon eşleştirme ${lab(item)}: ${item.ch ?: "EŞLEŞMEDİ"} | en yakın: ${db.explain(item.fp)} | en/boy=${GameLog.f(item.fp.aspect.toDouble())}")
+        }
 
         // 2-3) eşleşmeyenler için tahmin + soru
         val skippedFps = ArrayList<Fp>()
@@ -101,9 +120,13 @@ class LetterReader(ctx: Context) {
             val next = items.firstOrNull { it.ch == null && !it.skipped } ?: break
 
             val again = db.match(next.fp)          // önceki cevaplar yüzünden artık eşleşebilir
-            if (again != null) { next.ch = again; continue }
+            if (again != null) {
+                GameLog.d(T, "${lab(next)}: önceki cevaplar sayesinde artık eşleşti → $again")
+                next.ch = again; continue
+            }
 
             if (skippedFps.any { LetterDb.dist(it, next.fp) <= 20 } || askFn == null) {
+                GameLog.d(T, "${lab(next)}: sorulmadı (${if (askFn == null) "soru kapalı/29 harf tamam" else "benzeri daha önce atlandı"})")
                 next.skipped = true
                 continue
             }
@@ -111,6 +134,7 @@ class LetterReader(ctx: Context) {
             val remaining = items.count { it.ch == null && !it.skipped }
             val guess = guess(next.crop)
             val answer = askFn(next.crop, guess, remaining)
+            GameLog.i(T, "kullanıcıya soruldu ${lab(next)}: ML Kit tahmini=${guess ?: "yok"} kalan=$remaining → cevap=${answer ?: "ATLA"} | parmak izi=${next.fp.bits}")
             if (answer == null) {
                 skippedFps.add(next.fp)
                 next.skipped = true
@@ -127,16 +151,22 @@ class LetterReader(ctx: Context) {
             if (item.ch != null) continue
             if (item.rackIdx >= 0) {
                 item.ch = db.nearest(item.fp, if (complete) 120 else 45)
+                GameLog.d(T, "yedek (en yakın şablon, sınır=${if (complete) 120 else 45}) ${lab(item)}: ${item.ch ?: "BULUNAMADI"} | en yakın: ${db.explain(item.fp)}")
             } else if (relaxBoard) {
                 item.ch = db.matchRelaxed(item.fp)
                 if (item.ch != null) item.cell?.let { relaxedNow.add(it) }
+                GameLog.d(T, "gevşek eşleşme ${lab(item)}: ${item.ch ?: "BULUNAMADI"} | en yakın: ${db.explain(item.fp)}")
             }
         }
         lastRelaxed = relaxedNow
+        for (item in items) if (item.ch == null) {
+            GameLog.w(T, "ÇÖZÜLEMEDİ ${lab(item)} | en yakın: ${db.explain(item.fp)} | en/boy=${GameLog.f(item.fp.aspect.toDouble())} | parmak izi=${item.fp.bits}")
+        }
 
         lastUnresolved = items.count { it.ch == null } + rackMissing
         lastUnresolvedRack = items.count { it.rackIdx >= 0 && it.ch == null } + rackMissing
         lastUnresolvedBoard = items.count { it.rackIdx < 0 && it.ch == null }
+        GameLog.i(T, "okuma özeti: raf=${items.filter { it.rackIdx >= 0 && it.ch != null }.sortedBy { it.rackIdx }.joinToString("") { it.ch.toString() }} rafOkunamayan=$lastUnresolvedRack tahtaOkunamayan=$lastUnresolvedBoard gevşekOkunan=${relaxedNow.size} toplamÇözülemeyen=$lastUnresolved şablonSayısı=${db.size()}")
 
         val rack = items.filter { it.rackIdx >= 0 && it.ch != null }
             .sortedBy { it.rackIdx }.map { it.ch!! }
