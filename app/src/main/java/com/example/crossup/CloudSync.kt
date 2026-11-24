@@ -4,8 +4,6 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import org.json.JSONObject
-import java.io.InputStream
-import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -32,10 +30,6 @@ object CloudSync {
         prefs(ctx).edit().putString(KEY_URI, uri.toString()).apply()
     }
 
-    fun disconnect(ctx: Context) {
-        prefs(ctx).edit().remove(KEY_URI).remove(KEY_MSG).apply()
-    }
-
     private fun buildJson(ctx: Context): String =
         JSONObject()
             .put("v", 3)
@@ -51,16 +45,6 @@ object CloudSync {
         o.optJSONArray("letters")?.let { added += LetterDb.get(ctx).mergeJson(it) }
         return added
     }
-
-    /** Elle yedek: dosyaya yaz. */
-    fun exportTo(ctx: Context, out: OutputStream) {
-        out.write(buildJson(ctx.applicationContext).toByteArray(Charsets.UTF_8))
-        out.flush()
-    }
-
-    /** Elle yedek: dosyadan birleştirerek oku. Eklenen kayıt sayısını döner. */
-    fun importFrom(ctx: Context, inp: InputStream): Int =
-        mergeText(ctx.applicationContext, inp.readBytes().toString(Charsets.UTF_8))
 
     /** Buluttan oku, birleştir, geri yaz. Mesaj döner (hata olsa da fırlatmaz). */
     @Synchronized
