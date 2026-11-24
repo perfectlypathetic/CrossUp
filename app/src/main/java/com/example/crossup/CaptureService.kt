@@ -123,7 +123,7 @@ class CaptureService : Service() {
             })
 
         status = TextView(this).apply {
-            setTextColor(Color.WHITE); textSize = 13f
+            setTextColor(Color.WHITE); textSize = 12f
             text = "Hazır. 'Analiz'e bas."
         }
         val row = LinearLayout(this).apply {
@@ -141,14 +141,39 @@ class CaptureService : Service() {
             addView(btn("Öğren (kaydet)") { learn() })
         }
 
+        // Skor düzeltme satırları (rakibin yanlış harfleri gibi görünmeyen puanlar için).
+        val rowMe = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btn("Ben −5") { status.text = controller.adjustScore(true, -5) })
+            addView(btn("Ben −1") { status.text = controller.adjustScore(true, -1) })
+            addView(btn("Ben +1") { status.text = controller.adjustScore(true, 1) })
+            addView(btn("Ben +5") { status.text = controller.adjustScore(true, 5) })
+        }
+        val rowOpp = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btn("Rkp −5") { status.text = controller.adjustScore(false, -5) })
+            addView(btn("Rkp −1") { status.text = controller.adjustScore(false, -1) })
+            addView(btn("Rkp +1") { status.text = controller.adjustScore(false, 1) })
+            addView(btn("Rkp +5") { status.text = controller.adjustScore(false, 5) })
+            addView(btn("Yeni oyun") { status.text = controller.resetGame(); markers.clear() })
+        }
+
         val dm = resources.displayMetrics
+        // Uzun açıklamalar için kaydırılabilir, sınırlı yükseklikte metin alanı.
+        val maxTextH = (dm.heightPixels * 0.26f).toInt()
+        val scroll = object : ScrollView(this@CaptureService) {
+            override fun onMeasure(widthSpec: Int, heightSpec: Int) {
+                super.onMeasure(widthSpec, View.MeasureSpec.makeMeasureSpec(maxTextH, View.MeasureSpec.AT_MOST))
+            }
+        }
+        scroll.addView(status)
         panelLp = WindowManager.LayoutParams(
             (dm.widthPixels * 0.92f).toInt(), WindowManager.LayoutParams.WRAP_CONTENT, type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = (dm.widthPixels * 0.04f).toInt(); y = (dm.heightPixels * 0.65f).toInt()
+            x = (dm.widthPixels * 0.04f).toInt(); y = (dm.heightPixels * 0.55f).toInt()
         }
 
         // Sürükleme tutamacı: buradan tutup paneli istediğin yere taşı.
@@ -171,7 +196,7 @@ class CaptureService : Service() {
 
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(0xCC000000.toInt()); setPadding(16, 0, 16, 8)
-            addView(handle); addView(status); addView(row); addView(row2)
+            addView(handle); addView(scroll); addView(row); addView(row2); addView(rowMe); addView(rowOpp)
         }
         wm.addView(panel, panelLp)
     }
@@ -326,14 +351,20 @@ class CaptureService : Service() {
         }
     }
 
-    /** Sonucu göster: ekranda sadece koyulacak harfler işaretlenir, panelde kısa özet yazar. */
+    /** Sonucu göster: ekranda koyulacak harfler işaretlenir, panelde plan ve nedenler yazar. */
     private fun show(a: Analysis) {
         markers.set(a)
-        val moves = if (a.plan.pass) "PAS (güvenli hamle yok)" else a.plan.placements.joinToString("   ") {
-            "${it.letter} → (${it.cell.r + 1},${it.cell.c + 1})"
+        val p = a.plan
+        val moves = when {
+            p.swap.isNotEmpty() -> "HARF DEĞİŞTİR: " + p.swap.joinToString(" ")
+            p.pass -> "PAS"
+            else -> p.placements.joinToString("   ") { "${it.letter} → (${it.cell.r + 1},${it.cell.c + 1})" }
         }
-        status.text = "Raf: ${a.rack.joinToString("")}\n$moves" +
-            (if (a.note.isNotEmpty()) "\n${a.note}" else "")
+        val sb = StringBuilder()
+        sb.append("Raf: ").append(a.rack.joinToString("")).append("\n").append(moves)
+        if (p.lines.isNotEmpty()) sb.append("\n").append(p.lines.joinToString("\n"))
+        if (a.note.isNotEmpty()) sb.append("\n").append(a.note)
+        status.text = sb.toString()
     }
 
     private fun notification(): Notification {
@@ -354,18 +385,25 @@ class CaptureService : Service() {
 
 /**
  * Hücrelerin üstüne çizer (ekran görüntüsü koordinatı = ekran koordinatı).
- * Sadece planın önerdiği hamleler: kırmızı daire içinde koyulacak harf.
+ * Planın önerdiği hamleler: kırmızı daire içinde koyulacak harf. Bilgisi olmayan hücreler: sarı nokta.
  */
 class MarkerView(ctx: Context) : View(ctx) {
     private var a: Analysis? = null
     private val bg = Paint().apply { color = 0xCCE53935.toInt(); style = Paint.Style.FILL }
     private val tx = Paint().apply { color = Color.WHITE; textAlign = Paint.Align.CENTER; isFakeBoldText = true; isAntiAlias = true }
+    // Kelimesi bilinmeyen (bilgi yok) hücreler: küçük sarı nokta.
+    private val unk = Paint().apply { color = 0xCCFFC107.toInt(); style = Paint.Style.FILL; isAntiAlias = true }
 
     fun set(x: Analysis) { a = x; invalidate() }
     fun clear() { a = null; invalidate() }
 
     override fun onDraw(c: Canvas) {
         val an = a ?: return
+        for (uc in an.plan.unknownCells) {
+            val r = an.board.cellRects[uc.r][uc.c]
+            val cx = (r.x0 + r.x1) / 2f; val cy = (r.y0 + r.y1) / 2f
+            c.drawCircle(cx, cy, (r.x1 - r.x0) * 0.09f, unk)
+        }
         for (pl in an.plan.placements) {
             val r = an.board.cellRects[pl.cell.r][pl.cell.c]
             val cx = (r.x0 + r.x1) / 2f; val cy = (r.y0 + r.y1) / 2f
