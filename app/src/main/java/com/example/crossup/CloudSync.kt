@@ -3,6 +3,7 @@ package com.example.crossup.ai
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import com.example.crossup.GameLog
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -28,6 +29,7 @@ object CloudSync {
         val rw = flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
         runCatching { ctx.contentResolver.takePersistableUriPermission(uri, rw) }
         prefs(ctx).edit().putString(KEY_URI, uri.toString()).apply()
+        GameLog.i("CloudSync", "bulut dosyası seçildi: $uri (izin bayrakları=$flags)")
     }
 
     private fun buildJson(ctx: Context): String =
@@ -51,11 +53,13 @@ object CloudSync {
     fun sync(ctx: Context): String {
         val app = ctx.applicationContext
         val uri = uri(app) ?: return "Bulut bağlı değil"
+        GameLog.i("CloudSync", "eşitleme başladı: $uri | yerel: ${ClueDb.get(app).size()} kelime, ${LetterDb.get(app).size()} harf şablonu")
         val msg = try {
             val text = app.contentResolver.openInputStream(uri)?.use {
                 it.readBytes().toString(Charsets.UTF_8)
             } ?: ""
             val added = if (text.isNotBlank()) mergeText(app, text) else 0
+            GameLog.i("CloudSync", "buluttan okundu: ${text.length} karakter, yeni kayıt=$added")
 
             val bytes = buildJson(app).toByteArray(Charsets.UTF_8)
             val out = try {
@@ -64,12 +68,15 @@ object CloudSync {
                 app.contentResolver.openOutputStream(uri, "w")
             } ?: error("Dosya yazılamadı")
             out.use { it.write(bytes); it.flush() }
+            GameLog.i("CloudSync", "buluta yazıldı: ${bytes.size} bayt")
             "Bulut eşitlendi (buluttan $added yeni kayıt)"
         } catch (e: Exception) {
+            GameLog.e("CloudSync", "eşitleme HATASI", e)
             "Bulut hatası: ${e.message ?: e.javaClass.simpleName}"
         }
         val time = SimpleDateFormat("dd.MM HH:mm", Locale.getDefault()).format(Date())
         prefs(app).edit().putString(KEY_MSG, "$time — $msg").apply()
+        GameLog.i("CloudSync", "sonuç: $msg")
         return msg
     }
 }
