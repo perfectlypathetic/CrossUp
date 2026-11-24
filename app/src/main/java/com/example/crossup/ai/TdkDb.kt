@@ -27,6 +27,8 @@ class TdkDb private constructor(private val ctx: Context) {
     private var buckets: Array<Bucket> = emptyArray()
     private var stemId: HashMap<String, Int> = HashMap()
     private var idf: DoubleArray = DoubleArray(0)
+    /** Başlık kelimelerin aksansız küçük harfli hali (satır sonunda bölünmüş kelimeleri birleştirmek için). */
+    private var wordSet: HashSet<String> = HashSet()
 
     @Volatile var isLoaded = false; private set
     @Volatile var wordCount = 0; private set
@@ -51,6 +53,17 @@ class TdkDb private constructor(private val ctx: Context) {
             "olma", "etme", "yapma", "yapan", "edilen", "olup", "oldugu", "icinde",
             "uzerinde", "sonra", "once", "bkz", "bak", "ilgili", "bazi", "pek", "hem",
             "tum", "butun", "ayni", "diger", "bunun", "sunun", "onun"
+        )
+
+        /** Türkçe çekim/yapım ekleri (aksansız). Sadece "bu parça bir kelimeye benziyor mu" kontrolünde kullanılır. */
+        private val SUFFIXES = arrayOf(
+            "lerin", "larin", "leri", "lari", "lerde", "larda", "lerden", "lardan",
+            "ler", "lar", "nin", "nun", "ini", "unu", "ine", "una", "inde", "unda",
+            "den", "dan", "ten", "tan", "de", "da", "te", "ta", "ye", "ya", "ne", "na",
+            "yi", "yu", "ni", "nu", "in", "un", "si", "su", "li", "lu", "lik", "luk",
+            "siz", "suz", "sel", "sal", "ci", "cu", "ce", "ca", "la", "le", "yla", "yle",
+            "mak", "mek", "ma", "me", "mis", "mus", "dir", "dur", "tir", "tur",
+            "i", "u", "e", "a"
         )
 
         private val PAREN = Regex("\\([^)]*\\)")
@@ -150,6 +163,7 @@ class TdkDb private constructor(private val ctx: Context) {
             val bk = Array(MAX_LEN + 1) { Bucket() }
             val ids = HashMap<String, Int>()
             val dfList = ArrayList<Int>()
+            val ws = HashSet<String>()
             var n = 0
 
             openAsset().bufferedReader(Charsets.UTF_8).useLines { lines ->
@@ -173,6 +187,7 @@ class TdkDb private constructor(private val ctx: Context) {
                         dfList[id] = dfList[id] + 1
                         tmp[k++] = id
                     }
+                    ws.add(fold(word))
                     bk[word.length].words.add(word)
                     bk[word.length].stems.add(tmp.copyOf(k))
                     n++
@@ -181,6 +196,7 @@ class TdkDb private constructor(private val ctx: Context) {
 
             if (n == 0) throw IOException("tdk.txt okundu ama içinde kelime yok")
 
+            wordSet = ws
             val total = n.toDouble()
             idf = DoubleArray(dfList.size) { ln(1.0 + total / dfList[it]) }
             buckets = bk
@@ -195,6 +211,31 @@ class TdkDb private constructor(private val ctx: Context) {
             Log.w(TAG, "TDK yüklenemedi: $lastError")
             return false
         }
+    }
+
+    /** Aksansız küçük harfli metin, sözlükte başlık kelime olarak var mı? */
+    fun isWord(folded: String): Boolean = folded in wordSet
+
+    /**
+     * Metin bir Türkçe kelimeye benziyor mu? Başlık kelime olarak var olması ya da
+     * (ekleri atılınca, en az 3 harf kalacak şekilde) bir başlık kelimeye dönüşmesi yeterli.
+     * Girdi aksansız, küçük harfli, sadece a-z olmalı (bkz. fold).
+     */
+    fun looksLikeWord(folded: String): Boolean {
+        if (!isLoaded || folded.isEmpty()) return false
+        if (folded in wordSet) return true
+        for (suf in SUFFIXES) {
+            if (folded.length - suf.length >= 3 && folded.endsWith(suf)) {
+                val root = folded.substring(0, folded.length - suf.length)
+                if (root in wordSet) return true
+                // ikinci kat ek (ör. kitap-lar-in)
+                for (suf2 in SUFFIXES) {
+                    if (root.length - suf2.length >= 3 && root.endsWith(suf2) &&
+                        root.substring(0, root.length - suf2.length) in wordSet) return true
+                }
+            }
+        }
+        return false
     }
 
     private fun fits(w: String, pattern: String): Boolean {
