@@ -158,6 +158,12 @@ class CaptureService : Service() {
             addView(btn("Yeni oyun") { status.text = controller.resetGame(); markers.clear() })
         }
 
+        // Rakip son turunda harf DEĞİŞTİRDİYSE (tahtada görünmez) bas, sonra Analiz'e bas.
+        val rowSwap = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btn("Rkp harf değiştirdi (+1)") { status.text = controller.addOppSwap() })
+        }
+
         val dm = resources.displayMetrics
         // Uzun açıklamalar için kaydırılabilir, sınırlı yükseklikte metin alanı.
         val maxTextH = (dm.heightPixels * 0.26f).toInt()
@@ -196,7 +202,7 @@ class CaptureService : Service() {
 
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(0xCC000000.toInt()); setPadding(16, 0, 16, 8)
-            addView(handle); addView(scroll); addView(row); addView(row2); addView(rowMe); addView(rowOpp)
+            addView(handle); addView(scroll); addView(row); addView(row2); addView(rowMe); addView(rowOpp); addView(rowSwap)
         }
         wm.addView(panel, panelLp)
     }
