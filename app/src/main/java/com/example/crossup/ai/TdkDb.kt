@@ -2,6 +2,7 @@ package com.example.crossup.ai
 
 import android.content.Context
 import android.util.Log
+import com.example.crossup.GameLog
 import com.example.crossup.game.TR
 import java.io.File
 import java.io.IOException
@@ -151,6 +152,7 @@ class TdkDb private constructor(private val ctx: Context) {
             ensureLoaded()
         } catch (e: Throwable) {
             lastError = (e.message ?: e.javaClass.simpleName).take(120)
+            GameLog.e(TAG, "TDK dosyası kurulamadı: $lastError", e)
             false
         }
     }
@@ -159,6 +161,8 @@ class TdkDb private constructor(private val ctx: Context) {
     @Synchronized
     fun ensureLoaded(): Boolean {
         if (isLoaded) return true
+        val t0 = System.currentTimeMillis()
+        GameLog.i(TAG, "sözlük yükleniyor…")
         try {
             val bk = Array(MAX_LEN + 1) { Bucket() }
             val ids = HashMap<String, Int>()
@@ -205,10 +209,12 @@ class TdkDb private constructor(private val ctx: Context) {
             isLoaded = true
             lastError = ""
             Log.i(TAG, "TDK yüklendi: $n kelime, ${dfList.size} kök")
+            GameLog.i(TAG, "TDK yüklendi: $n kelime, ${dfList.size} kök, ${System.currentTimeMillis() - t0} ms, kaynak=${if (localFile().exists() && localFile().length() > 0) "telefona yüklenmiş kopya" else "assets"}")
             return true
         } catch (e: Throwable) {   // OutOfMemoryError dahil
             lastError = (e.message ?: e.javaClass.simpleName).take(120)
             Log.w(TAG, "TDK yüklenemedi: $lastError")
+            GameLog.e(TAG, "TDK YÜKLENEMEDİ: $lastError", e)
             return false
         }
     }
