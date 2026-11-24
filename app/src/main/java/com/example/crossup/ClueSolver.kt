@@ -1,6 +1,7 @@
 package com.example.crossup.ai
 
 import com.example.crossup.game.Candidate
+import com.example.crossup.GameLog
 import com.example.crossup.game.TR
 import kotlinx.coroutines.CancellationException
 import org.json.JSONArray
@@ -55,11 +56,13 @@ class GeminiClueSolver(
             if (c != null) out[i] = c else todo.add(i)
         }
 
+        GameLog.i("ClueSolver", "toplu çözüm: ${items.size} ipucu, önbellekten ${items.size - todo.size}, AI'a sorulacak ${todo.size}")
         // Kalanları gruplar halinde, sırayla sor (kotayı ve hız sınırını korumak için).
         for (chunk in todo.chunked(BATCH_SIZE)) {
             if (System.currentTimeMillis() > deadline) break
             try {
                 val parsed = askChunk(chunk.map { items[it] })
+                GameLog.i("ClueSolver", "grup cevabı: ${parsed.count { it != null }}/${chunk.size} ipucu için cevap geldi")
                 for ((j, idx) in chunk.withIndex()) {
                     val r = parsed[j] ?: continue
                     out[idx] = r
@@ -69,6 +72,7 @@ class GeminiClueSolver(
                 throw e
             } catch (e: Exception) {
                 lastError = (e.message ?: e.javaClass.simpleName).take(160)
+                GameLog.e("ClueSolver", "toplu istek hatası: $lastError", e)
                 break   // bir grup başarısızsa diğerleri de büyük ihtimalle başarısız olur; kotayı harcama
             }
         }
@@ -92,6 +96,7 @@ class GeminiClueSolver(
         )
 
         val json = GeminiHttp.askParts(apiKey, models, parts, 400 + 150 * qs.size, readTimeoutMs = 60_000)
+        GameLog.d("ClueSolver", "ham AI cevabı: ${json.take(600)}")
 
         // Model bazen diziyi bir nesnenin içine koyar: {"results":[...]}
         val arr: JSONArray = if (json.trimStart().startsWith("{")) {
