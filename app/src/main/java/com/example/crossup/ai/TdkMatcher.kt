@@ -30,6 +30,10 @@ class TdkMatcher(ctx: Context) {
     @Volatile var lastReason: String = ""
         private set
 
+    /** Son readClue() çağrısında birleştirilen parçalar (teşhis için), ör. "KUYRUKL+U". */
+    @Volatile var lastJoins: String = ""
+        private set
+
     companion object {
         private const val TAG = "TdkMatcher"
 
@@ -47,6 +51,12 @@ class TdkMatcher(ctx: Context) {
         const val MIN_LETTERS = 4
         /** OCR öncesi görüntü bu yüksekliğe (piksel) büyütülür (en çok 4 kat). */
         private const val TARGET_H = 360f
+        /** enlarge() ile eklenen kenar boşluğu (piksel). */
+        private const val PAD = 24
+        /** Bir satırın genişliği kutunun bu oranından büyükse "kutuyu dolduruyor" sayılır. */
+        private const val FULL_LINE = 0.80f
+        /** Tek başına gerçek kelime olan kısa parçalar: bunlar bölünmüş ek sayılmaz. */
+        private val SHORT_WORDS = hashSetOf("ve", "mi", "mu", "de", "da", "ki", "bu", "su", "ya", "ne", "na", "ise", "ile")
 
         /** Element adı (aksansız, küçük harf) -> sembol. Semboller bilerek büyük harfle yazıldı. */
         private val ELEMENTS: List<Pair<String, String>> = listOf(
@@ -73,22 +83,95 @@ class TdkMatcher(ctx: Context) {
     /** Sözlük yüklenemediyse sebebi (teşhis için). */
     val loadError: String get() = db.lastError
 
-    /** İpucu görüntüsündeki yazıyı okur. Okunamazsa boş metin döner. */
+    /** OCR'ın okuduğu tek satır: metin, üst konum ve genişliğin görüntü genişliğine oranı (bilinmiyorsa null). */
+    private class ClueLine(val text: String, val top: Int, val left: Int, val fill: Float?)
+
+    /** İpucu görüntüsündeki yazıyı okur. Okunamazsa boş metin döner. Ortadan bölünmüş kelimeler birleştirilir. */
     suspend fun readClue(crop: Bitmap): String {
         if (!db.isLoaded) return ""
         return try {
             val big = enlarge(crop)
-            val raw = suspendCancellableCoroutine<String> { cont ->
+            val contentW = (big.width - 2 * PAD).toFloat().coerceAtLeast(1f)
+            val lines = suspendCancellableCoroutine<List<ClueLine>> { cont ->
                 recognizer.process(InputImage.fromBitmap(big, 0))
-                    .addOnSuccessListener { t -> if (cont.isActive) cont.resume(t.text) }
-                    .addOnFailureListener { if (cont.isActive) cont.resume("") }
+                    .addOnSuccessListener { t ->
+                        val out = ArrayList<ClueLine>()
+                        for (b in t.textBlocks) for (l in b.lines) {
+                            val bb = l.boundingBox
+                            out.add(ClueLine(l.text, bb?.top ?: 0, bb?.left ?: 0, bb?.let { it.width() / contentW }))
+                        }
+                        if (cont.isActive) cont.resume(out)
+                    }
+                    .addOnFailureListener { if (cont.isActive) cont.resume(emptyList()) }
             }
-            raw.replace("-\n", "").replace('\n', ' ').trim()
+            joinLines(lines)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             ""
         }
+    }
+
+    /** Aksansız, küçük harfli, sadece a-z harflerinden oluşan hali. */
+    private fun letters(s: String): String = TdkDb.fold(s).filter { it in 'a'..'z' }
+
+    /**
+     * Satır sonunda kelime ortadan bölünmüş mü? (ör. "KUYRUKL" + "U HİLAL", "HAYIRSEV" + "ER").
+     * Ipucu kutusuna sığmayan uzun kelimeler alt satıra bölünür; ama bunu doğrudan anlamanın yolu yok,
+     * o yüzden sözlük + satırın genişliği birlikte kullanılır:
+     *  - A+B sözlükte bir kelimeye benziyor ve A tek başına benzemiyorsa -> birleştir.
+     *  - A satırı kutuyu neredeyse dolduruyorsa (kelime sığmadığı için kesilmiştir) ve B çok kısaysa
+     *    (1-3 harf, ek parçası gibi) -> birleştir.
+     * Kesme işareti (ROMA'DA), nokta/virgül ile biten satırlar asla birleştirilmez.
+     */
+    private fun shouldJoin(a: String, b: String, aFill: Float?): Boolean {
+        if (a.isEmpty() || b.isEmpty()) return false
+        if (!a.last().isLetter() || !b.first().isLetter()) return false
+        if (a.indexOf('\'') >= 0 || a.indexOf('\u2019') >= 0 || b.indexOf('\'') >= 0 || b.indexOf('\u2019') >= 0) return false
+        val fa = letters(a)
+        val fb = letters(b)
+        if (fa.length < 2 || fb.isEmpty()) return false
+        val wA = db.looksLikeWord(fa)
+        val wJ = db.looksLikeWord(fa + fb)
+        val full = aFill != null && aFill >= FULL_LINE
+        // 1) Birleşince kelime oluyor, ilk parça kelime değil.
+        if (wJ && !wA) return true
+        // 2) Satır dolu + kısa ek parçası + birleşince kelime.
+        if (wJ && full && fa.length >= 6 && fb.length <= 3 && !isRealShortWord(fb)) return true
+        // 3) Satır dolu + ilk parça kelime değil + 1-2 harflik kuyruk (ör. VAKTİNDE + N).
+        if (full && !wA && fa.length >= 6 && fb.length <= 2 && !isRealShortWord(fb)) return true
+        return false
+    }
+
+    private fun isRealShortWord(f: String) = f in SHORT_WORDS
+
+    /** OCR satırlarını tek metne çevirir; ortadan bölünmüş kelimeleri birleştirir. */
+    private fun joinLines(raw: List<ClueLine>): String {
+        val lines = if (raw.all { it.top != 0 || it.left != 0 })
+            raw.sortedWith(compareBy({ it.top }, { it.left })) else raw
+        val words = ArrayList<String>()
+        var prev: ClueLine? = null
+        val joins = ArrayList<String>()
+        for (line in lines) {
+            var toks = line.text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+            if (toks.isEmpty()) continue
+            if (prev != null && words.isNotEmpty()) {
+                val a = words.last()
+                val b = toks.first()
+                if (a.length > 1 && a.endsWith("-")) {
+                    words[words.size - 1] = a.dropLast(1) + b
+                    toks = toks.drop(1)
+                } else if (shouldJoin(a, b, prev.fill)) {
+                    words[words.size - 1] = a + b
+                    joins.add("$a+$b")
+                    toks = toks.drop(1)
+                }
+            }
+            words.addAll(toks)
+            prev = line
+        }
+        lastJoins = joins.joinToString(",")
+        return words.joinToString(" ")
     }
 
     /** "OKSİJENİN SİMGESİ" gibi ipuçları için element sembolü. Uymazsa null. */
@@ -156,7 +239,7 @@ class TdkMatcher(ctx: Context) {
         val scale = (TARGET_H / src.height.toFloat()).coerceIn(1f, 4f)
         val w = (src.width * scale).toInt().coerceAtLeast(1)
         val h = (src.height * scale).toInt().coerceAtLeast(1)
-        val pad = 24
+        val pad = PAD
         val out = Bitmap.createBitmap(w + 2 * pad, h + 2 * pad, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
         val p = src.getPixel(minOf(1, src.width - 1), minOf(1, src.height - 1))
