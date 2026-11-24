@@ -38,7 +38,7 @@ object CloudSync {
 
     private fun buildJson(ctx: Context): String =
         JSONObject()
-            .put("v", 2)
+            .put("v", 3)
             .put("clues", ClueDb.get(ctx).snapshot())
             .put("letters", LetterDb.get(ctx).snapshot())
             .toString()
