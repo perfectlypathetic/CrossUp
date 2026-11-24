@@ -21,11 +21,18 @@ class MainActivity : Activity() {
     private lateinit var updInfo: TextView
     @Volatile private var updating = false
 
+    // Güncelleme kontrolü için yardımcı değişkenler
+    private var lastCheck = 0L                       // en son ne zaman kontrol edildi
+    private var dialogShowing = false                // "Yeni sürüm" penceresi açık mı
+    private var pendingRel: Updater.Release? = null  // izin bekleyen güncelleme
+
     private companion object {
         const val REQ_PROJECTION = 100
         const val REQ_CLOUD_NEW = 103
         const val REQ_CLOUD_PICK = 104
         const val REQ_TDK = 105
+        const val CHECK_INTERVAL_MS = 30_000L        // art arda kontrolü engeller
+        var declinedBuild = 0                        // "Sonra" denen sürüm, tekrar sorulmaz
     }
 
     override fun onCreate(s: Bundle?) {
@@ -48,10 +55,6 @@ class MainActivity : Activity() {
         updInfo = TextView(this).apply {
             textSize = 14f; setPadding(0, 10, 0, 10)
             text = "Sürüm: v${BuildConfig.BUILD_NUMBER}"
-        }
-        val updBtn = Button(this).apply {
-            text = "Güncellemeyi kontrol et"
-            setOnClickListener { checkUpdate() }
         }
 
         val cloudNew = Button(this).apply {
@@ -97,19 +100,22 @@ class MainActivity : Activity() {
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40)
                 addView(keyBox); addView(go); addView(info)
-                addView(updInfo); addView(updBtn)
+                addView(updInfo)
                 addView(tdkPick)
                 addView(cloudNew); addView(cloudPick)
             })
         })
-
-        checkUpdate()   // uygulama açılınca GitHub'da yeni sürüm var mı bak
+        // Güncelleme kontrolü onResume'da otomatik yapılır (uygulama her açıldığında).
     }
 
     // ---------- Otomatik güncelleme (GitHub Releases) ----------
 
     private fun checkUpdate() {
         if (updating) return
+        val now = System.currentTimeMillis()
+        if (now - lastCheck < CHECK_INTERVAL_MS) return
+        lastCheck = now
+
         updInfo.text = "Güncelleme kontrol ediliyor…"
         Thread {
             val result = runCatching { Updater.latest() }
@@ -120,7 +126,7 @@ class MainActivity : Activity() {
                     updInfo.text = "Güncelleme kontrolü başarısız: ${result.exceptionOrNull()?.message}"
                 } else if (rel.isNewer) {
                     updInfo.text = "Yeni sürüm var: ${rel.tag} (şu an: v${BuildConfig.BUILD_NUMBER})"
-                    askUpdate(rel)
+                    if (rel.build != declinedBuild) askUpdate(rel)
                 } else {
                     updInfo.text = "Uygulama güncel (v${BuildConfig.BUILD_NUMBER})"
                 }
@@ -129,18 +135,22 @@ class MainActivity : Activity() {
     }
 
     private fun askUpdate(rel: Updater.Release) {
+        if (dialogShowing) return
+        dialogShowing = true
         AlertDialog.Builder(this)
             .setTitle("Yeni sürüm: ${rel.tag}")
             .setMessage("Şu anki sürüm: v${BuildConfig.BUILD_NUMBER}\n\n${rel.notes}\n\nŞimdi güncellensin mi?")
             .setPositiveButton("Güncelle") { _, _ -> startUpdate(rel) }
-            .setNegativeButton("Sonra", null)
+            .setNegativeButton("Sonra") { _, _ -> declinedBuild = rel.build }
+            .setOnDismissListener { dialogShowing = false }
             .show()
     }
 
     private fun startUpdate(rel: Updater.Release) {
         if (!packageManager.canRequestPackageInstalls()) {
+            pendingRel = rel   // izin verilip geri dönünce güncelleme kendiliğinden devam eder
             startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
-            Toast.makeText(this, "Bu uygulamaya \"bilinmeyen uygulamaları yükle\" iznini ver, sonra tekrar Güncelle'ye bas", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Bu uygulamaya \"bilinmeyen uygulamaları yükle\" iznini ver, sonra uygulamaya geri dön; güncelleme otomatik devam eder", Toast.LENGTH_LONG).show()
             return
         }
         updating = true
@@ -162,6 +172,16 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         refreshInfo()
+
+        // İzin için ayarlara gitmiş ve izni vermişse güncellemeye kaldığı yerden devam et,
+        // aksi halde yeni sürüm var mı diye otomatik bak.
+        val pending = pendingRel
+        if (pending != null && packageManager.canRequestPackageInstalls()) {
+            pendingRel = null
+            startUpdate(pending)
+        } else {
+            checkUpdate()
+        }
 
         // TDK sözlüğünü arka planda yükle (yüklüyse hemen biter).
         val tdkDb = TdkDb.get(this)
