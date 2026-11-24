@@ -43,6 +43,7 @@ object Updater {
         try {
             val code = c.responseCode
             if (code == 404) throw Exception("GitHub'da henüz yayınlanmış sürüm yok (veya depo gizli)")
+            GameLog.d("Updater", "GitHub yanıt kodu=$code")
             if (code != 200) throw Exception("GitHub yanıtı: $code")
             val text = c.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
             val o = JSONObject(text)
@@ -59,7 +60,9 @@ object Updater {
                 }
             }
             if (url.isEmpty()) throw Exception("Sürümde APK dosyası yok")
-            return Release(build, tag, url, o.optString("body"))
+            val rel = Release(build, tag, url, o.optString("body"))
+            GameLog.i("Updater", "son sürüm: $tag (build=$build) şu an=v${BuildConfig.BUILD_NUMBER} yeni mi=${rel.isNewer} apk=$url")
+            return rel
         } finally {
             c.disconnect()
         }
@@ -70,6 +73,7 @@ object Updater {
         val out = File(ctx.cacheDir, "update.apk")
         if (out.exists()) out.delete()
         val c = open(rel.apkUrl, false)
+        GameLog.i("Updater", "APK indiriliyor: ${rel.apkUrl}")
         try {
             if (c.responseCode != 200) throw Exception("İndirme hatası: ${c.responseCode}")
             val total = c.contentLengthLong
@@ -91,6 +95,7 @@ object Updater {
                 }
             }
             if (total > 0 && out.length() != total) throw Exception("İndirme yarım kaldı")
+            GameLog.i("Updater", "APK indirildi: ${out.length()} bayt (beklenen $total)")
         } finally {
             c.disconnect()
         }
@@ -105,6 +110,7 @@ object Updater {
             params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
         }
         val id = installer.createSession(params)
+        GameLog.i("Updater", "kurulum oturumu açıldı: id=$id apk=${apk.length()} bayt")
         val session = installer.openSession(id)
         try {
             apk.inputStream().use { inp ->
@@ -119,7 +125,9 @@ object Updater {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
             )
             session.commit(pending.intentSender)
+            GameLog.i("Updater", "kurulum onaya gönderildi (session.commit)")
         } catch (e: Exception) {
+            GameLog.e("Updater", "kurulum hatası", e)
             session.abandon()
             throw e
         } finally {
