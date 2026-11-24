@@ -47,6 +47,10 @@ class LetterReader(ctx: Context) {
     @Volatile var lastUnresolvedBoard: Int = 0
         private set
 
+    /** Son read() çağrısında GEVŞEK eşleşmeyle (daha az emin) okunan tahta hücreleri. Bunlardan veritabanına kelime öğrenilmez. */
+    @Volatile var lastRelaxed: Set<CellPos> = emptySet()
+        private set
+
     /** Son raf aramasının teşhis metni (panelde gösterilir). */
     @Volatile var lastRackInfo: String = ""
         private set
@@ -62,6 +66,8 @@ class LetterReader(ctx: Context) {
         relaxBoard: Boolean = false
     ): Reading {
         // 29 harfin hepsi kayıtlıysa kullanıcıya ASLA harf sorulmaz.
+        lastRelaxed = emptySet()
+        val relaxedNow = HashSet<CellPos>()
         val complete = db.isComplete()
         val askFn: AskLetter? = if (complete) null else ask
         val items = ArrayList<Item>()
@@ -123,8 +129,10 @@ class LetterReader(ctx: Context) {
                 item.ch = db.nearest(item.fp, if (complete) 120 else 45)
             } else if (relaxBoard) {
                 item.ch = db.matchRelaxed(item.fp)
+                if (item.ch != null) item.cell?.let { relaxedNow.add(it) }
             }
         }
+        lastRelaxed = relaxedNow
 
         lastUnresolved = items.count { it.ch == null } + rackMissing
         lastUnresolvedRack = items.count { it.rackIdx >= 0 && it.ch == null } + rackMissing
