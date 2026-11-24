@@ -34,6 +34,12 @@ class TurnTracker {
     val finished get() = endgame && idx >= seq.size
     val nextIsMine get() = seq.getOrNull(idx) == true
     val myTurnsLeft get() = seq.drop(idx).count { it }
+    /** Benim bir sonraki hamlemden itibaren kalan sıra (true = ben). Çözücü bunu kullanır. */
+    val seqFromMyNext: List<Boolean> get() {
+        val rest = seq.drop(idx)
+        val i = rest.indexOf(true)
+        return if (i < 0) emptyList() else rest.drop(i)
+    }
     /** Benim bir sonraki hamlemden sonra rakibin kalan hamle sayısı. */
     val oppAfterNextMine: Int get() {
         val rest = seq.drop(idx); val i = rest.indexOf(true)
@@ -113,6 +119,84 @@ class GameController(apiKey: String, ctx: Context) {
     /** Teşhis satırları (DEBUG_TDK açıkken). */
     private val tdkDebug = ArrayList<String>()
 
+    // ---------- Skor takibi (iki analiz arasındaki tahta farkından) ----------
+    private var myScore = 0
+    private var oppScore = 0
+    private var prevFilled: Set<CellPos>? = null
+    private var prevRack = ""
+    private var prevPlan: Plan? = null
+    private var lastSlotKeys: Set<String> = emptySet()
+
+    fun scoreLabel(): String = "Skor: ben $myScore – rakip $oppScore"
+
+    /** Elle skor düzeltme (rakibin yanlış harfleri gibi görünmeyen şeyler için). */
+    fun adjustScore(me: Boolean, delta: Int): String {
+        if (me) myScore += delta else oppScore += delta
+        return scoreLabel()
+    }
+
+    /** Yeni oyun: skorları ve tur sırasını sıfırlar. */
+    fun resetGame(): String {
+        myScore = 0; oppScore = 0
+        prevFilled = null; prevPlan = null; prevRack = ""
+        turns.reset()
+        return "Sıfırlandı. " + scoreLabel()
+    }
+
+    /**
+     * İki analiz arasında tahtaya eklenen hücrelerden puanları günceller.
+     * Raf değiştiyse ve önceki planımdaki hücreler dolduysa onlar benimdir; kalanlar rakibindir.
+     * Rakibin yanlış koyduğu (geri giden) harfler görünmez, gerekirse elle düzelt.
+     */
+    private fun trackScores(board: ParsedBoard, st: GameState, rack: List<Char>): String {
+        val filledNow: Set<CellPos> = board.cellsOf(CellKind.FILLED).toSet()
+        val pf = prevFilled
+        val oldPlan = prevPlan
+        val rackNow = rack.sorted().joinToString("")
+        var msg = ""
+        if (pf != null) {
+            val newCells = filledNow.filter { it !in pf }
+            if (newCells.isNotEmpty()) {
+                val iPlayed = oldPlan != null && oldPlan.placements.isNotEmpty() && rackNow != prevRack
+                val mine = HashSet<CellPos>()
+                if (iPlayed && oldPlan != null) {
+                    for (pl in oldPlan.placements) {
+                        if (pl.cell in newCells) {
+                            val k = st.known[pl.cell]
+                            if (k == null || k.uppercaseChar() == pl.letter.uppercaseChar()) mine.add(pl.cell)
+                        }
+                    }
+                }
+                val opp = HashSet<CellPos>()
+                for (c in newCells) if (c !in mine) opp.add(c)
+                var dMine = mine.size
+                var dOpp = opp.size
+                for (slot in board.slots) {
+                    var touched = false
+                    var oppTouched = false
+                    var complete = true
+                    for (c in slot.cells) {
+                        if (c !in filledNow) complete = false
+                        if (c in mine) touched = true
+                        if (c in opp) { touched = true; oppTouched = true }
+                    }
+                    if (complete && touched) {
+                        if (oppTouched) dOpp += slot.length else dMine += slot.length
+                    }
+                }
+                if (mine.size >= 6) dMine += 6 else if (mine.size >= 5) dMine += 5
+                if (opp.size >= 6) dOpp += 6 else if (opp.size >= 5) dOpp += 5
+                myScore += dMine
+                oppScore += dOpp
+                msg = "son hamleler: ben +$dMine, rakip +$dOpp"
+            }
+        }
+        prevFilled = filledNow
+        prevRack = rackNow
+        prevPlan = null
+        return msg
+    }
+
     /** AI'a sorulması gereken yuva. */
     private class Pending(val slot: WordSlot, val key: String, val pattern: String, val crop: Bitmap)
 
@@ -124,13 +208,23 @@ class GameController(apiKey: String, ctx: Context) {
     /** Tahtayı okumadan önce night light / ekran filtresini geri alır (filtre yoksa aynen döner). */
     private fun prep(bmp: Bitmap): Bitmap = bmp.normalizeTint()
 
-    /** Yeni oyun mu? İpucu hücrelerinin düzeni değiştiyse her şeyi sıfırla. */
+    /** Yeni oyun mu? İpucu hücrelerinin düzeni büyük ölçüde değiştiyse her şeyi sıfırla. */
     private fun syncSignature(board: ParsedBoard) {
+        val keys: Set<String> = board.slots.map { slotKey(it) }.toSet()
         val sig = board.slots.joinToString("|") { slotKey(it) }
         if (sig != signature) {
+            val denom = maxOf(1, maxOf(keys.size, lastSlotKeys.size))
+            val overlap = keys.intersect(lastSlotKeys).size.toDouble() / denom
+            val newGame = signature.isNotEmpty() && overlap < 0.5
             // Harfler konuma bağlı olduğu için yeni düzende sıfırlanır. İpucu önbellekleri
             // (görüntüye bağlı) silinmez; sadece "yazı yok" listesi temizlenir.
-            signature = sig; letterCache.clear(); relaxedCells.clear(); ocrEmpty.clear(); turns.reset()
+            signature = sig; lastSlotKeys = keys
+            letterCache.clear(); relaxedCells.clear(); ocrEmpty.clear()
+            if (newGame) {
+                turns.reset()
+                myScore = 0; oppScore = 0
+                prevFilled = null; prevPlan = null; prevRack = ""
+            }
         }
     }
 
@@ -229,6 +323,11 @@ class GameController(apiKey: String, ctx: Context) {
             error("Raftaki harfler okunamadı.\n[${letters.lastRackInfo}]")
         val rackUnread = letters.lastUnresolvedRack
 
+        // Skor takibi: önceki analizden bu yana tahtaya eklenenler.
+        val scoreMsg = trackScores(board, st, reading.rack)
+        st.myScore = myScore
+        st.oppScore = oppScore
+
         val deadline = System.currentTimeMillis() + AI_TIME_LIMIT_MS
 
         // ÖĞRENME: tamamen dolmuş yuvaların ipucu görüntüsünü ve cevabını telefona kaydet.
@@ -293,22 +392,34 @@ class GameController(apiKey: String, ctx: Context) {
         for ((s, c) in results) st.cands[s] = c
 
         progress("Hamle planlanıyor…")
+        // Torba / rakip rafı tahmini: oyunda toplam harf sayısı = boş hücre sayısı.
+        val emptyCount = st.emptyCells().size
+        val myTiles = reading.rack.size + rackUnread
+        val oppRack = if (myTiles < 6) maxOf(0, emptyCount - myTiles) else minOf(6, maxOf(0, emptyCount - myTiles))
+        val pool = if (myTiles < 6) 0 else maxOf(0, emptyCount - myTiles - oppRack)
+
         val ctx = if (turns.endgame)
-            TurnContext(true, turns.myTurnsLeft.coerceAtLeast(1), turns.oppAfterNextMine)
-        else Phase.context(st, 99, 1).let { TurnContext(false, it.myMovesLeft, it.opponentMovesAfterMe) }
+            TurnContext(true, turns.myTurnsLeft.coerceAtLeast(1), turns.oppAfterNextMine,
+                myScore, oppScore, pool, oppRack, turns.seqFromMyNext)
+        else
+            TurnContext(false, 99, 1, myScore, oppScore, pool, oppRack, emptyList())
 
         val plan = Planner(st).plan(reading.rack, ctx)
+        prevPlan = plan
 
         val solved = board.slots.count { st.emptyIn(it) == 0 || !st.cands[it].isNullOrEmpty() }
 
         // Ekranda gösterilecek kısa not: sadece işe yarar şeyler.
         val note = buildString {
-            if (turns.endgame) append(turns.label)
+            append(scoreLabel())
+            if (scoreMsg.isNotEmpty()) append(" ($scoreMsg)")
+            append("\nBoş hücre: $emptyCount · torba ≈ $pool · rakip rafı ≈ $oppRack")
+            if (turns.endgame) append("\n").append(turns.label)
             if (rackUnread > 0) {
                 if (isNotEmpty()) append("\n")
                 append("Rafta $rackUnread karo okunamadı, kalan ${reading.rack.size} harfle planlandı.")
             }
-            if (!turns.endgame && st.inEndgame()) append("Boş hücre azaldı: 'Son4' butonlarından birine bas.")
+            if (!turns.endgame && st.inEndgame()) append("\nBoş hücre azaldı: sıra kimdeyse 'Son4: ben' / 'Son4: rakip' butonuna bas (kesin hesap için gerekli).")
             if (turns.endgame && !turns.nextIsMine && !turns.finished) append(" (rakibin hamlesini bekle)")
             if (tdkHits > 0) {
                 if (isNotEmpty()) append("\n")
