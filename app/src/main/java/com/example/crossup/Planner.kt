@@ -39,6 +39,11 @@ data class Plan(
  * @param poolSize           çekilebilecek (torbada kalan) harf sayısı tahmini; 0 ise harf değiştirilemez
  * @param oppRackSize        rakibin rafındaki harf sayısı tahmini
  * @param seq                son 4 turda BENİM bir sonraki hamlemden itibaren sıra (true = ben)
+ * @param oppHeld            rakibin elinde şu an TUTTUĞU harf sayısı (kimliği bilinmez).
+ *                           OYUN KURALI: oynayan kişiye harfler hemen tamamlanmaz; sırası tekrar
+ *                           gelince eksik harfler torbadan RASTGELE verilir. Yani rakibin eli şu an
+ *                           (6 - son turda oynadığı/değiştirdiği) kadardır; sırası gelince
+ *                           min(6 - oppHeld, torba) yeni rastgele harf çeker. 0 = bilinmiyor.
  */
 class TurnContext(
     val endgame: Boolean,
@@ -48,7 +53,8 @@ class TurnContext(
     val oppScore: Int = 0,
     val poolSize: Int = 0,
     val oppRackSize: Int = 6,
-    val seq: List<Boolean> = emptyList()
+    val seq: List<Boolean> = emptyList(),
+    val oppHeld: Int = 0
 )
 
 class PlannerConfig(
@@ -58,7 +64,8 @@ class PlannerConfig(
     val bonus6: Int = 6,
     val maxUnknownForSwap: Int = 2,     // bundan fazla bilinmeyen hücre varsa harf değiştirme önerilmez
     val minUsefulP: Double = 0.55,      // bu ihtimalin altı "düşük ihtimal" sayılır
-    val leadEntryBonus: Double = 1.0    // son 4 ele önde girmenin değeri
+    val leadEntryBonus: Double = 1.0,   // son 4 ele önde girmenin değeri
+    val heldMatch: Double = 0.35        // rakibin ELDE TUTTUĞU harflerin aradığımız harf olma payı (tutulan harfler çoğunlukla "işe yaramaz" harflerdir)
 )
 
 /**
@@ -255,7 +262,11 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
         return m
     }
 
-    private fun oppCompleteProb(rem: List<CellPos>, unseen: Map<Char, Int>, u: Int, draws: Int): Double {
+    /**
+     * pop: harflerin çekileceği havuzun büyüklüğü, draws: o havuzdan çekilen harf sayısı.
+     * Rakibin her gerekli harfe sahip olma ihtimali hipergeometrik olarak hesaplanır.
+     */
+    private fun oppCompleteProb(rem: List<CellPos>, unseen: Map<Char, Int>, pop: Int, draws: Int): Double {
         var unknown = 0
         val need = HashMap<Char, Int>()
         for (c in rem) {
@@ -263,12 +274,21 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
             if (g == null) unknown++ else need[g] = (need[g] ?: 0) + 1
         }
         var p = 1.0
-        for ((l, n) in need) p *= atLeast(u, unseen[l] ?: 0, draws, n)
+        for ((l, n) in need) p *= atLeast(pop, minOf(unseen[l] ?: 0, pop), draws, n)
         if (unknown > 0) p *= Math.pow(cfg.unknownHold, unknown.toDouble())
         return p * cfg.oppKnows
     }
 
-    /** Hamleden sonra rakibin tamamlayabileceği kelimelerin beklenen puanı. */
+    /**
+     * Hamleden sonra rakibin tamamlayabileceği kelimelerin beklenen puanı.
+     *
+     * KURAL: rakibe harfler hemen tamamlanmaz, sırası gelince torbadan rastgele verilir.
+     * Rakibin sıradaki eli = ELDE TUTTUKLARI (held) + YENİ ÇEKTİKLERİ (fresh).
+     *  - Yeni çekilenler gerçekten rastgeledir (torbadan, hipergeometrik).
+     *  - Elde tutulanlar rakibin geçen tur OYNAMADIĞI harflerdir; zaten oynanabilecek bir hücreye
+     *    ait olsalardı oynardı. Bu yüzden çoğunlukla bizim aradığımız harf değildirler (heldMatch).
+     *  - Torba tamamen rakibe geçecekse (fresh >= pool) rakip kalan her harfi görür: kesin bilgi.
+     */
     private fun totalRisk(placed: Set<CellPos>, rackAfter: List<Char>, ctx: TurnContext): Double {
         if (ctx.opponentMovesAfterMe <= 0) return 0.0
         val unseen = unseenCounts(placed, rackAfter)
@@ -276,13 +296,21 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
         val sumUnseen = unseen.values.sum()
         if (u < sumUnseen) u = sumUnseen
         if (u < 1) u = 1
-        val draws = minOf(ctx.oppRackSize, u)
+        val cap = maxOf(1, ctx.oppRackSize)
+        val held = minOf(ctx.oppHeld.coerceIn(0, cap), u)
+        val pool = u - held
+        val fresh = minOf(cap - held, pool)
+        val total = held + fresh
+        val absorbed = fresh >= pool
+        val w = if (absorbed) 1.0 else maxOf(cfg.heldMatch, held.toDouble() / u)
         var risk = 0.0
         for (slot in st.board.slots) {
             val rem = ArrayList<CellPos>()
             for (c in slot.cells) if (!st.isFilled(c) && c !in placed) rem.add(c)
-            if (rem.isEmpty() || rem.size > draws) continue
-            risk += slot.length * oppCompleteProb(rem, unseen, u, draws)
+            if (rem.isEmpty() || rem.size > total) continue
+            val pRand = oppCompleteProb(rem, unseen, u, total)
+            val pFresh = if (rem.size <= fresh && pool > 0) oppCompleteProb(rem, unseen, pool, fresh) else 0.0
+            risk += slot.length * (w * pRand + (1.0 - w) * pFresh)
         }
         return risk
     }
@@ -361,9 +389,15 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
 
     // ------------------------------------------------------------------ SON 4: kesin hesap
 
+    /** Torba, rakibin bir sonraki çekilişinde boşalmıyorsa kesin (tam bilgili) hesap geçerli değildir. */
+    private fun poolBlocksExact(ctx: TurnContext): Boolean =
+        ctx.poolSize > maxOf(0, ctx.oppRackSize - ctx.oppHeld)
+
     private fun planEndgame(rack: List<Char>, ctx: TurnContext): Plan? {
         val e = empties.size
         if (e == 0 || e > 14 || rack.isEmpty() || !ctx.seq[0]) return null
+        // Kesin hesap için torba rakibin sıradaki çekilişinde tamamen boşalmalı (rakip kalan her harfi görür).
+        if (poolBlocksExact(ctx)) return null
 
         val letterOf = CharArray(e)
         for (i in 0 until e) {
@@ -529,7 +563,12 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
 
         // 7) Ekran satırları
         val lines = ArrayList<String>()
-        if (ctx.endgame) lines.add("Son4: kesin hesap yapılamadı (bazı hücrelerin harfi belirsiz), tahminle oynanıyor.")
+        if (ctx.endgame) {
+            lines.add(
+                if (poolBlocksExact(ctx)) "Son4: torbada hâlâ harf var (≈${ctx.poolSize}), kesin hesap yapılamaz; tahminle oynanıyor."
+                else "Son4: kesin hesap yapılamadı (bazı hücrelerin harfi belirsiz), tahminle oynanıyor."
+            )
+        }
         if (swap.isNotEmpty()) {
             lines.add("Torbada ≈${ctx.poolSize} harf var; ${swap.joinToString(" ")} harflerini değiştir.")
         } else if (finalPl.isEmpty()) {
