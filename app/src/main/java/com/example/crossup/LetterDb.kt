@@ -2,6 +2,7 @@ package com.example.crossup.ai
 
 import android.content.Context
 import android.graphics.Bitmap
+import com.example.crossup.GameLog
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -127,7 +128,29 @@ class LetterDb private constructor(ctx: Context) {
                     list.add(T(Fp(o.getString("b"), o.getDouble("a").toFloat()), o.getString("c")[0]))
                 }
             }
+        }.onFailure { GameLog.e("LetterDb", "letters.json okunamadı", it) }
+        GameLog.i("LetterDb", "yüklendi: ${list.size} harf şablonu (${counts()})")
+    }
+
+    /** Teşhis: hangi harften kaç şablon var. */
+    @Synchronized
+    fun counts(): String {
+        val m = java.util.TreeMap<Char, Int>()
+        for (t in list) m[t.ch] = (m[t.ch] ?: 0) + 1
+        return m.entries.joinToString(" ") { "${it.key}:${it.value}" }
+    }
+
+    /** Teşhis: bu parmak izine en yakın 3 FARKLI harf ve mesafeleri. */
+    @Synchronized
+    fun explain(fp: Fp): String {
+        if (list.isEmpty()) return "şablon yok"
+        val per = HashMap<Char, Int>()
+        for (t in list) {
+            val d = dist(fp, t.fp)
+            val old = per[t.ch]
+            if (old == null || d < old) per[t.ch] = d
         }
+        return per.entries.sortedBy { it.value }.take(3).joinToString(" ") { "${it.key}=${it.value}" }
     }
 
     /** Eşleşen harfi döner; emin değilse null. */
@@ -178,7 +201,9 @@ class LetterDb private constructor(ctx: Context) {
     /** Doğrulanmış harfi şablon olarak kaydeder (çok benzer şablon varsa eklemez). */
     @Synchronized
     fun learn(fp: Fp, ch: Char) {
-        if (add(fp, ch)) save()
+        val added = add(fp, ch)
+        if (added) save()
+        GameLog.i("LetterDb", "öğrenildi: '$ch' ${if (added) "YENİ şablon eklendi" else "(çok benzer şablon zaten var, eklenmedi)"} | toplam=${list.size}")
     }
 
     private fun add(fp: Fp, ch: Char): Boolean {
@@ -206,6 +231,7 @@ class LetterDb private constructor(ctx: Context) {
             }
         }
         if (added > 0) save()
+        GameLog.i("LetterDb", "buluttan birleştirme: +$added şablon (toplam ${list.size})")
         return added
     }
 
@@ -220,6 +246,6 @@ class LetterDb private constructor(ctx: Context) {
             val json = toJsonArray().toString()
             tmp.writeText(json)
             if (!tmp.renameTo(file)) file.writeText(json)
-        }
+        }.onFailure { GameLog.e("LetterDb", "kaydetme hatası", it) }
     }
 }
