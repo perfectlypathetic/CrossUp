@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.util.Log
+import com.example.crossup.GameLog
 import com.example.crossup.game.Candidate
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
@@ -102,12 +103,20 @@ class TdkMatcher(ctx: Context) {
                         }
                         if (cont.isActive) cont.resume(out)
                     }
-                    .addOnFailureListener { if (cont.isActive) cont.resume(emptyList()) }
+                    .addOnFailureListener {
+                        GameLog.w(TAG, "OCR (ML Kit) hata verdi: ${it.message}")
+                        if (cont.isActive) cont.resume(emptyList())
+                    }
             }
-            joinLines(lines)
+            val joined = joinLines(lines)
+            GameLog.d(TAG, "OCR ${crop.width}x${crop.height}: ${lines.size} satır: " +
+                lines.joinToString(" | ") { "\"${it.text}\"@${it.top},${it.left},dolgu=${it.fill?.let { f -> GameLog.f(f.toDouble()) } ?: "?"}" } +
+                " → \"$joined\" birleştirmeler=[$lastJoins]")
+            joined
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            GameLog.e(TAG, "OCR istisna", e)
             ""
         }
     }
@@ -194,6 +203,14 @@ class TdkMatcher(ctx: Context) {
      * liste = en olası adaylar (weight: en iyiye göre göreli).
      */
     fun candidates(clueText: String, length: Int, pattern: String): List<Candidate>? {
+        val r = candidatesCore(clueText, length, pattern)
+        GameLog.d(TAG, "candidates uzunluk=$length desen=$pattern yazı=\"${clueText.take(80)}\" → " +
+            (if (r == null) "ÇÖZÜLEMEDİ" else r.joinToString(",") { it.word + "(" + GameLog.f(it.weight) + ")" }) +
+            " | neden: $lastReason")
+        return r
+    }
+
+    private fun candidatesCore(clueText: String, length: Int, pattern: String): List<Candidate>? {
         lastReason = ""
         if (!db.isLoaded) { lastReason = "sözlük yüklü değil"; return null }
         if (clueText.count { it.isLetter() } < MIN_LETTERS) {
@@ -210,6 +227,7 @@ class TdkMatcher(ctx: Context) {
 
         val hits = db.search(length, pattern, q)
         if (hits.isEmpty()) { lastReason = "sözlükte eşleşme yok"; return null }
+        GameLog.d(TAG, "TDK arama: kökler=$q uzunluk=$length desen=$pattern → ${hits.size} sonuç, ilk 5: " + hits.take(5).joinToString(", ") { it.word + "=" + GameLog.f(it.score) })
 
         val top = hits[0].score
         val minTop = if (length <= 2) MIN_TOP_SHORT else MIN_TOP
