@@ -1,6 +1,7 @@
 package com.example.crossup.parser
 
 import android.graphics.Bitmap
+import com.example.crossup.GameLog
 import java.io.ByteArrayOutputStream
 
 class BitmapPixelSource(private val bmp: Bitmap) : PixelSource {
@@ -46,12 +47,19 @@ fun Bitmap.normalizeTint(): Bitmap {
     val mr = rs[rs.size / 2]; val mg = gs[gs.size / 2]; val mb = bs[bs.size / 2]
 
     // Kenar zaten (neredeyse) beyazsa filtre yok. Çok koyuysa (koyu tema vb.) dokunma.
-    if (mr >= 246 && mg >= 246 && mb >= 246) return this
-    if (minOf(mr, mg, mb) < 120) return this
+    if (mr >= 246 && mg >= 246 && mb >= 246) {
+        GameLog.d("Tint", "renk filtresi yok (sol kenar rengi $mr,$mg,$mb)")
+        return this
+    }
+    if (minOf(mr, mg, mb) < 120) {
+        GameLog.w("Tint", "sol kenar çok koyu ($mr,$mg,$mb): düzeltme yapılmadı (koyu tema / farklı ekran?)")
+        return this
+    }
 
     val gr = minOf(2.2f, 255f / mr)
     val gg = minOf(2.2f, 255f / mg)
     val gb = minOf(2.2f, 255f / mb)
+    GameLog.i("Tint", "renk filtresi düzeltiliyor: sol kenar=$mr,$mg,$mb kazanç=${GameLog.f(gr.toDouble())},${GameLog.f(gg.toDouble())},${GameLog.f(gb.toDouble())}")
 
     val px = IntArray(w * h)
     getPixels(px, 0, w, 0, 0, w, h)
