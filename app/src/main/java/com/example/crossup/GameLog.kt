@@ -266,7 +266,7 @@ object GameLog {
         val b = line.toByteArray(Charsets.UTF_8)
         if (bytes + b.size > MAX_BYTES) {
             capped = true
-            raw("!!! LOG SINIRI (60 MB) AŞILDI, yazma durduruldu. "Eski logları sil" tuşuna bas !!!\n".toByteArray(Charsets.UTF_8))
+            raw("!!! LOG SINIRI (60 MB) AŞILDI, yazma durduruldu. \"Eski logları sil\" tuşuna bas !!!\n".toByteArray(Charsets.UTF_8))
             return
         }
         bytes += b.size
