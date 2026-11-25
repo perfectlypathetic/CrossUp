@@ -146,14 +146,19 @@ class GameController(apiKey: String, ctx: Context) {
     private var oppSwapApplied = 0
     /** Bu analizde yeni bir tur algılandı mı (tahtaya harf eklendi veya raf değişti). */
     private var turnChanged = false
+    /** Bu analizde rakibin tahtaya koyduğu harf sayısı (rakip harf koyduysa değiştirmiş olamaz: ya koyar ya değiştirir). */
+    private var oppCellsNow = 0
     private var runNo = 0
 
-    /** Rakip son turunda harf değiştirdiyse (tahtada görünmez) her basışta +1; 6'dan sonra sıfırlanır. */
+    /**
+     * Rakip son turunda harf değiştirdiyse (tahtada görünmez) her basışta +1; 6'dan sonra sıfırlanır.
+     * KURAL: harf değiştirmek o turun hamlesidir; rakip değiştirdiyse harf koymamıştır, sıra bana geçmiştir.
+     */
     fun addOppSwap(): String {
         oppSwapPending = if (oppSwapPending >= 6) 0 else oppSwapPending + 1
         GameLog.i("Game", "BUTON etkisi: rakip harf değiştirdi → bekleyen değişim=$oppSwapPending (bir sonraki Analiz'de uygulanır)")
         return if (oppSwapPending == 0) "Rakip harf değiştirmedi olarak işaretlendi."
-        else "Rakip son turda $oppSwapPending harf değiştirdi. (Şimdi Analiz'e bas.)"
+        else "Rakip son turda $oppSwapPending harf değiştirdi (hamlesi buydu, harf koymadı). (Şimdi Analiz'e bas.)"
     }
 
     fun scoreLabel(): String = "Skor: ben $myScore – rakip $oppScore"
@@ -188,6 +193,7 @@ class GameController(apiKey: String, ctx: Context) {
         val rackNow = rack.sorted().joinToString("")
         var msg = ""
         turnChanged = false
+        oppCellsNow = 0
         GameLog.i("Score", "skor takibi: önceki doluluk=${pf?.size ?: "yok (ilk analiz)"} şimdi=${filledNow.size} raf=$rackNow önceki raf=${prevRack.ifEmpty { "yok" }} önceki plan=${oldPlan ?: "yok"}")
         if (pf != null) {
             val newCells = filledNow.filter { it !in pf }
@@ -207,8 +213,11 @@ class GameController(apiKey: String, ctx: Context) {
                 val opp = HashSet<CellPos>()
                 for (c in newCells) if (c !in mine) opp.add(c)
                 GameLog.i("Score", "hücre sahipliği: benim=[${mine.joinToString(" ") { "(${it.r + 1},${it.c + 1})" }}] rakibin=[${opp.joinToString(" ") { "(${it.r + 1},${it.c + 1})" }}]")
-                var dMine = mine.size
-                var dOpp = opp.size
+                // YENİ PUANLAMA: koyulan her harf +1; bir kelimeyi bitiren hamlede o kelimedeki
+                // harfler +2'şer (kelimenin tamamı için ayrıca puan yok).
+                // Kelimeyi bitiren: o kelimeye rakip dokunduysa rakip, yoksa ben.
+                val finMine = HashSet<CellPos>()
+                val finOpp = HashSet<CellPos>()
                 for (slot in board.slots) {
                     var touched = false
                     var oppTouched = false
@@ -219,23 +228,36 @@ class GameController(apiKey: String, ctx: Context) {
                         if (c in opp) { touched = true; oppTouched = true }
                     }
                     if (complete && touched) {
-                        if (oppTouched) dOpp += slot.length else dMine += slot.length
-                        GameLog.i("Score", "yuva TAMAMLANDI ${slot.dir} ipucu(${slot.clueCell.r + 1},${slot.clueCell.c + 1}) uzunluk=${slot.length} → ${if (oppTouched) "rakibe" else "bana"} +${slot.length}")
+                        if (oppTouched) {
+                            for (c in slot.cells) if (c in opp) finOpp.add(c)
+                        } else {
+                            for (c in slot.cells) if (c in mine) finMine.add(c)
+                        }
+                        GameLog.i("Score", "yuva TAMAMLANDI ${slot.dir} ipucu(${slot.clueCell.r + 1},${slot.clueCell.c + 1}) uzunluk=${slot.length} → ${if (oppTouched) "rakip" else "ben"} bitirdi (bitiren harflerin her biri +$FINISH_LETTER_POINTS)")
                     }
                 }
-                if (mine.size >= 6) dMine += 6 else if (mine.size >= 5) dMine += 5
-                if (opp.size >= 6) dOpp += 6 else if (opp.size >= 5) dOpp += 5
+                var dMine = mine.size + finMine.size * (FINISH_LETTER_POINTS - 1)
+                var dOpp = opp.size + finOpp.size * (FINISH_LETTER_POINTS - 1)
+                if (mine.size >= 6) dMine += BONUS_6_LETTERS else if (mine.size >= 5) dMine += BONUS_5_LETTERS
+                if (opp.size >= 6) dOpp += BONUS_6_LETTERS else if (opp.size >= 5) dOpp += BONUS_5_LETTERS
                 myScore += dMine
                 oppScore += dOpp
                 msg = "son hamleler: ben +$dMine, rakip +$dOpp"
-                GameLog.i("Score", "SKOR GÜNCELLENDİ: ben +$dMine (5/6 harf bonusu dahil), rakip +$dOpp → ben=$myScore rakip=$oppScore | rakibin son turda koyduğu harf=${opp.size}")
+                GameLog.i("Score", "SKOR GÜNCELLENDİ: ben +$dMine (harf=${mine.size}, bitiren harf=${finMine.size}), rakip +$dOpp (harf=${opp.size}, bitiren harf=${finOpp.size}) → ben=$myScore rakip=$oppScore | rakibin son turda koyduğu harf=${opp.size}")
                 oppLastPlayed = opp.size       // rakibin elinde kalan harf = 6 - bu sayı
+                oppCellsNow = opp.size
                 turnChanged = true
             } else if (prevRack.isNotEmpty() && rackNow != prevRack) {
-                // Tahtaya yeni harf gelmedi ama rafım değişti: yeni tur, rakip harf koymadı (pas/değiştirme).
-                GameLog.i("Score", "tahtaya yeni harf yok ama raf değişti → rakip harf koymadı (pas/değiştirme)")
-                oppLastPlayed = 0
-                turnChanged = true
+                if (oldPlan != null && oldPlan.swap.isNotEmpty()) {
+                    // Ben harf değiştirdim: bu benim hamlemdi, sıra rakibe geçti. Rakibin ne yaptığı henüz bilinmiyor
+                    // (yeni harf yok); rakibin elini etkileyen bir şey değişmedi.
+                    GameLog.i("Score", "tahtaya yeni harf yok, rafım değişti ve planım HARF DEĞİŞTİRMEKTİ → kendi değiştirmem (hamlem bitti, sıra rakipte)")
+                } else {
+                    // Tahtaya yeni harf gelmedi ama rafım değişti: yeni tur, rakip harf koymadı (pas/değiştirme).
+                    GameLog.i("Score", "tahtaya yeni harf yok ama raf değişti → rakip harf koymadı (pas/değiştirme)")
+                    oppLastPlayed = 0
+                    turnChanged = true
+                }
             }
         }
         GameLog.i("Score", "takip sonucu: turnChanged=$turnChanged skor ben=$myScore rakip=$oppScore rakipSonOynadığı=$oppLastPlayed")
@@ -408,7 +430,19 @@ class GameController(apiKey: String, ctx: Context) {
 
         // Skor takibi: önceki analizden bu yana tahtaya eklenenler.
         val scoreMsg = trackScores(board, st, reading.rack)
-        if (oppSwapPending > 0) { oppSwapApplied = oppSwapPending; oppSwapPending = 0 }
+        if (oppSwapPending > 0) {
+            if (oppCellsNow > 0) {
+                // Rakip tahtaya harf koyduysa aynı turda harf değiştirmiş olamaz (hamle ya biri ya diğeri).
+                GameLog.w("Game", "rakip $oppCellsNow harf koymuş; 'harf değiştirdi' işareti ($oppSwapPending) yok sayıldı")
+                oppSwapApplied = 0
+            } else {
+                // Rakibin hamlesi harf değiştirmekti: tahtaya harf koymadı, sıra bana geçti.
+                oppSwapApplied = oppSwapPending
+                oppLastPlayed = 0
+                turnChanged = true
+            }
+            oppSwapPending = 0
+        }
         else if (turnChanged) oppSwapApplied = 0
         GameLog.d("Game", "rakip değiştirme: uygulanan=$oppSwapApplied bekleyen=$oppSwapPending turnChanged=$turnChanged")
         st.myScore = myScore
