@@ -1,695 +1,649 @@
 package com.example.crossup.game
 
-import com.example.crossup.parser.*
+import android.content.Context
+import android.graphics.Bitmap
 import com.example.crossup.GameLog
+import com.example.crossup.ai.AskLetter
+import com.example.crossup.ai.ClueDb
+import com.example.crossup.ai.ClueQuery
+import com.example.crossup.ai.GeminiClueSolver
+import com.example.crossup.ai.LetterReader
+import com.example.crossup.ai.LetterDb
+import com.example.crossup.ai.TdkMatcher
+import com.example.crossup.parser.*
+import java.util.concurrent.ConcurrentHashMap
 
-/** Boş hücre sayısı bunun altına inince "son 4 tur" başlar. */
-const val ENDGAME_EMPTY_LIMIT = 12
+/** Son 4 tur sırası. Kullanıcı butonla başlatır; her turdan sonra "ilerle" ile bir adım atlanır. */
+class TurnTracker {
+    var endgame = false; private set
+    private var seq: List<Boolean> = emptyList()   // true = ben
+    private var idx = 0
 
-data class Placement(val letter: Char, val cell: CellPos, val p: Double)
+    fun start(meFirst: Boolean) {
+        seq = if (meFirst) listOf(true, false, true, false) else listOf(false, true, false, true)
+        idx = 0; endgame = true
+        GameLog.i("Turns", "Son4 başlatıldı: ilk sıra ${if (meFirst) "BENDE" else "RAKİPTE"} → sıra=${seq.joinToString("") { if (it) "B" else "R" }}")
+    }
 
-/** Rafta olup bu tur oynanmayan bir harf ve NEDEN oynanmadığı. */
-data class HeldLetter(val letter: Char, val reason: String)
+    /** Sırayı bir adım ilerletir. Son 4 başlamadıysa veya bittiyse false döner. */
+    fun advance(): Boolean {
+        if (!endgame || idx >= seq.size) return false
+        idx++
+        GameLog.i("Turns", "sıra ilerletildi → $label")
+        return true
+    }
 
-/**
- * @param swap          doluysa bu tur oynamak yerine bu harfler değiştirilmeli
- * @param held          oynanmayan harflerin nedenleri (bilgi eksikliği mi, strateji mi?)
- * @param unknownCells  hiçbir yuvadan bilgi gelmeyen (kelimesi bilinmeyen) boş hücreler
- * @param lines         ekranda gösterilecek açıklama satırları
- */
-data class Plan(
-    val placements: List<Placement>,
-    val expectedValue: Double,
-    val pass: Boolean,
-    val swap: List<Char> = emptyList(),
-    val held: List<HeldLetter> = emptyList(),
-    val unknownCells: List<CellPos> = emptyList(),
-    val lines: List<String> = emptyList()
-) {
-    override fun toString(): String =
-        if (swap.isNotEmpty()) "DEĞİŞTİR " + swap.joinToString("")
-        else if (pass) "PAS (EV=%.2f)".format(expectedValue)
-        else placements.joinToString { "${it.letter}→(${it.cell.r + 1},${it.cell.c + 1}) %${(it.p * 100).toInt()}" } +
-            "  EV=%.2f".format(expectedValue)
+    fun reset() { endgame = false; seq = emptyList(); idx = 0; GameLog.i("Turns", "tur takibi sıfırlandı") }
+
+    val finished get() = endgame && idx >= seq.size
+    val nextIsMine get() = seq.getOrNull(idx) == true
+    val myTurnsLeft get() = seq.drop(idx).count { it }
+    /** Benim bir sonraki hamlemden itibaren kalan sıra (true = ben). Çözücü bunu kullanır. */
+    val seqFromMyNext: List<Boolean> get() {
+        val rest = seq.drop(idx)
+        val i = rest.indexOf(true)
+        return if (i < 0) emptyList() else rest.drop(i)
+    }
+    /** Benim bir sonraki hamlemden sonra rakibin kalan hamle sayısı. */
+    val oppAfterNextMine: Int get() {
+        val rest = seq.drop(idx); val i = rest.indexOf(true)
+        return if (i < 0) 0 else rest.drop(i + 1).count { !it }
+    }
+    val label get() = if (!endgame) "normal faz" else if (finished) "oyun bitti" else
+        "son4: sıra ${if (nextIsMine) "BENDE" else "RAKİPTE"} (${idx + 1}/4)"
 }
 
-/**
- * @param endgame            "Son4" butonlarıyla son 4 tur başlatıldı mı
- * @param opponentMovesAfterMe bu hamleden sonra rakibin oynayacağı hamle sayısı (0 ise son hamle)
- * @param myScore / oppScore  izlenen puanlar
- * @param poolSize           çekilebilecek (torbada kalan) harf sayısı tahmini; 0 ise harf değiştirilemez
- * @param oppRackSize        rakibin rafındaki harf sayısı tahmini
- * @param seq                son 4 turda BENİM bir sonraki hamlemden itibaren sıra (true = ben)
- * @param oppHeld            rakibin elinde şu an TUTTUĞU harf sayısı (kimliği bilinmez).
- *                           OYUN KURALI: oynayan kişiye harfler hemen tamamlanmaz; sırası tekrar
- *                           gelince eksik harfler torbadan RASTGELE verilir. Yani rakibin eli şu an
- *                           (6 - son turda oynadığı/değiştirdiği) kadardır; sırası gelince
- *                           min(6 - oppHeld, torba) yeni rastgele harf çeker. 0 = bilinmiyor.
- */
-class TurnContext(
-    val endgame: Boolean,
-    val myMovesLeft: Int,
-    val opponentMovesAfterMe: Int,
-    val myScore: Int = 0,
-    val oppScore: Int = 0,
-    val poolSize: Int = 0,
-    val oppRackSize: Int = 6,
-    val seq: List<Boolean> = emptyList(),
-    val oppHeld: Int = 0
+class Analysis(
+    val board: ParsedBoard, val rack: List<Char>, val plan: Plan,
+    val note: String,
+    val solvedSlots: Int = 0,
+    val totalSlots: Int = 0
 )
 
-class PlannerConfig(
-    val oppKnows: Double = 0.85,        // rakibin kelimeyi bildiği varsayımı
-    val unknownHold: Double = 0.25,     // kelimesi bilinmeyen hücre için rakibin harfe sahip olma çarpanı
-    val bonus5: Int = 5,
-    val bonus6: Int = 6,
-    val maxUnknownForSwap: Int = 2,     // bundan fazla bilinmeyen hücre varsa harf değiştirme önerilmez
-    val minUsefulP: Double = 0.55,      // bu ihtimalin altı "düşük ihtimal" sayılır
-    val leadEntryBonus: Double = 1.0,   // son 4 ele önde girmenin değeri
-    val heldMatch: Double = 0.35        // rakibin ELDE TUTTUĞU harflerin aradığımız harf olma payı (tutulan harfler çoğunlukla "işe yaramaz" harflerdir)
+/** "Öğren" butonunun sonucu. */
+class LearnResult(
+    val fullSlots: Int,      // tamamen dolu yuva sayısı
+    val added: Int,          // veritabanına yeni eklenen kelime sayısı
+    val unreadCells: Int,    // harfi okunamayan dolu hücre sayısı
+    val total: Int           // veritabanındaki toplam kelime
 )
 
-/**
- * Son 4 tur için TAM BİLGİLİ minimax çözücü.
- * Sonda toplam harf sayısı = boş hücre sayısı olduğundan, rakibin harfleri
- * (boş hücrelerin harfleri - benim rafım) olarak kesin bilinir.
- * Hamle: o turda elindeki harflerden istediğin alt kümeyi doğru yerlere koymak (ya da pas).
- * Puan: harf başına +1, kelimeyi bitiren +uzunluk, tek turda 5/6 harf +5/+6.
- * Değer = (benim puanım - rakibin puanı) farkı; ben maksimize, rakip minimize eder.
- */
-class EndgameSolver(
-    private val letterOf: CharArray,
-    private val slotMasks: IntArray,
-    private val slotLens: IntArray,
-    private val seq: BooleanArray,
-    myTiles: List<Char>,
-    private val bonus5: Int,
-    private val bonus6: Int
-) {
-    class RootMove(val taken: Int, val value: Int, val gain: Int, val n: Int)
+/** "Harfleri tanı" butonunun sonucu. */
+class LetterResult(
+    val rack: List<Char>,    // okunan raf
+    val boardFilled: Int,    // tahtadaki dolu hücre sayısı
+    val boardKnown: Int,     // bunlardan harfi bilinenler
+    val unresolved: Int,     // tanınamayan karo sayısı (raf + tahta)
+    val rackMissing: Int,    // tanınamayan RAF karosu sayısı
+    val info: String = ""    // raf arama teşhisi
+)
 
-    private val nc = letterOf.size
-    private val letters: List<Char> = letterOf.toList().distinct()
-    private val nl = letters.size
-    private val lidx = IntArray(nc) { letters.indexOf(letterOf[it]) }
-    private val myCnt = IntArray(nl)
-    private val oppCnt = IntArray(nl)
-    private val memo = HashMap<Long, Int>()
-    val rootMoves = ArrayList<RootMove>()
+class GameController(apiKey: String, ctx: Context) {
+    companion object {
+        /** Bir analizde AI ile ipucu çözmeye ayrılan toplam süre. */
+        const val AI_TIME_LIMIT_MS = 120_000L
 
-    init {
-        val total = IntArray(nl)
-        for (i in 0 until nc) total[lidx[i]]++
-        for (t in myTiles) {
-            val k = letters.indexOf(t)
-            if (k >= 0) myCnt[k]++
+        /**
+         * Yapay zeka şalteri. false = AI hiç kullanılmaz (kota harcanmaz, API anahtarı gerekmez).
+         * Tekrar açmak istersen true yap.
+         */
+        const val USE_AI = false
+
+        /**
+         * TDK teşhisi. true = analiz notunda her ipucu için OCR'ın okuduğu yazı ve
+         * sözlüğün neden çözdüğü / çözemediği görünür. Sorun çözülünce false yap.
+         */
+        const val DEBUG_TDK = true
+    }
+
+    private val parser = GridParser()
+    private val solver by lazy { GeminiClueSolver(apiKey) }
+    private val letters = LetterReader(ctx)
+    private val db = ClueDb.get(ctx)
+    private val tdk = TdkMatcher(ctx)
+    val turns = TurnTracker()
+
+        init {
+            GameLog.i("Game", "GameController oluşturuldu: USE_AI=$USE_AI DEBUG_TDK=$DEBUG_TDK apiAnahtarı=${if (apiKey.isBlank()) "yok" else "var"} | kayıtlı kelime=${db.size()} | harf şablonu=${LetterDb.get(ctx).size()} | TDK yüklü=${tdk.ready}")
         }
-        for (k in 0 until nl) oppCnt[k] = total[k] - myCnt[k]
+
+    private var signature = ""
+    private val letterCache = HashMap<CellPos, Char>()
+    /** Harfi GEVŞEK eşleşmeyle okunmuş (emin olunmayan) hücreler: bunlardan kelime öğrenilmez. */
+    private val relaxedCells = HashSet<CellPos>()
+    // NOT: Aşağıdaki üç önbellek yuva konumuna değil, İPUCU GÖRÜNTÜSÜNÜN parmak izine göre tutulur.
+    // Izgara okuması bir an şaşsa / yeni oyun başlasa bile aynı ipucu bir daha sorulmaz / okunmaz.
+    private val candCache = ConcurrentHashMap<String, List<Candidate>>()
+    /** İpucu görüntüsünden okunan yazı (OCR). Sadece DOLU sonuçlar kalıcı tutulur. */
+    private val ocrCache = ConcurrentHashMap<String, String>()
+    /** OCR'ın yazı bulamadığı (resimli) ipuçları; sadece bu oyun için, yeni oyunda sıfırlanır. */
+    private val ocrEmpty: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    /** AI'a bir kez sorulmuş ipuçları (görüntü parmak izi + uzunluk). */
+    private val asked: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    /** Son AI hatası (sadece "hata oldu mu" bilgisi için). */
+    @Volatile private var lastAiError = ""
+    /** Bu analizde TDK ile çözülen ipucu sayısı. */
+    private var tdkHits = 0
+    /** Teşhis satırları (DEBUG_TDK açıkken). */
+    private val tdkDebug = ArrayList<String>()
+
+    // ---------- Skor takibi (iki analiz arasındaki tahta farkından) ----------
+    private var myScore = 0
+    private var oppScore = 0
+    private var prevFilled: Set<CellPos>? = null
+    private var prevRack = ""
+    private var prevPlan: Plan? = null
+    private var lastSlotKeys: Set<String> = emptySet()
+
+    // ---------- Rakibin eli takibi ----------
+    // KURAL: oynayan kişiye harfler hemen tamamlanmaz. Rakip oynadıktan sonra elinde (6 - oynadığı)
+    // harf KALIR; sırası tekrar gelince eksikler torbadan rastgele verilir.
+    /** Rakibin son turda tahtaya koyduğu harf sayısı. -1 = bilinmiyor (ilk analiz). */
+    private var oppLastPlayed = -1
+    /** Kullanıcının "Rkp değiştirdi" tuşuyla bildirdiği, bir sonraki Analiz'de kullanılacak sayı. */
+    private var oppSwapPending = 0
+    /** Son turda rakibin değiştirdiği harf sayısı (Analiz'de uygulanmış hali). */
+    private var oppSwapApplied = 0
+    /** Bu analizde yeni bir tur algılandı mı (tahtaya harf eklendi veya raf değişti). */
+    private var turnChanged = false
+    /** Bu analizde rakibin tahtaya koyduğu harf sayısı (rakip harf koyduysa değiştirmiş olamaz: ya koyar ya değiştirir). */
+    private var oppCellsNow = 0
+    private var runNo = 0
+
+    /**
+     * Rakip son turunda harf değiştirdiyse (tahtada görünmez) her basışta +1; 6'dan sonra sıfırlanır.
+     * KURAL: harf değiştirmek o turun hamlesidir; rakip değiştirdiyse harf koymamıştır, sıra bana geçmiştir.
+     */
+    fun addOppSwap(): String {
+        oppSwapPending = if (oppSwapPending >= 6) 0 else oppSwapPending + 1
+        GameLog.i("Game", "BUTON etkisi: rakip harf değiştirdi → bekleyen değişim=$oppSwapPending (bir sonraki Analiz'de uygulanır)")
+        return if (oppSwapPending == 0) "Rakip harf değiştirmedi olarak işaretlendi."
+        else "Rakip son turda $oppSwapPending harf değiştirdi (hamlesi buydu, harf koymadı). (Şimdi Analiz'e bas.)"
     }
 
-    private fun key(mask: Int, idx: Int): Long {
-        var k = mask.toLong()
-        k = (k shl 4) or idx.toLong()
-        for (i in 0 until nl) k = (k shl 3) or (myCnt[i].toLong() and 7L)
-        return k
+    fun scoreLabel(): String = "Skor: ben $myScore – rakip $oppScore"
+
+    /** Elle skor düzeltme (rakibin yanlış harfleri gibi görünmeyen şeyler için). */
+    fun adjustScore(me: Boolean, delta: Int): String {
+        if (me) myScore += delta else oppScore += delta
+        GameLog.i("Score", "elle skor düzeltme: ${if (me) "ben" else "rakip"} ${if (delta > 0) "+" else ""}$delta → ${scoreLabel()}")
+        return scoreLabel()
     }
 
-    private fun points(taken: Int, n: Int, mask: Int): Int {
-        if (n == 0) return 0
-        var pts = n
-        val after = mask and taken.inv()
-        for (s in slotMasks.indices) {
-            val sm = slotMasks[s]
-            if ((sm and taken) != 0 && (sm and after) == 0) pts += slotLens[s]
-        }
-        if (n >= 6) pts += bonus6 else if (n == 5) pts += bonus5
-        return pts
-    }
-
-    private fun solve(mask: Int, idx: Int): Int {
-        if (idx >= seq.size || mask == 0) return 0
-        val k = key(mask, idx)
-        val hit = memo[k]
-        if (hit != null) return hit
-        val isMe = seq[idx]
-        val start = if (isMe) Int.MIN_VALUE else Int.MAX_VALUE
-        val v = search(0, mask, idx, 0, 0, isMe, start)
-        memo[k] = v
-        return v
-    }
-
-    private fun search(pos: Int, mask: Int, idx: Int, taken: Int, n: Int, isMe: Boolean, best0: Int): Int {
-        if (pos == nc) {
-            val gain = points(taken, n, mask)
-            val child = solve(mask and taken.inv(), idx + 1)
-            val v = (if (isMe) gain else -gain) + child
-            if (idx == 0) rootMoves.add(RootMove(taken, v, gain, n))
-            return if (isMe) maxOf(best0, v) else minOf(best0, v)
-        }
-        var best = search(pos + 1, mask, idx, taken, n, isMe, best0)
-        if (((mask shr pos) and 1) == 1) {
-            val li = lidx[pos]
-            val cnt = if (isMe) myCnt else oppCnt
-            if (cnt[li] > 0) {
-                cnt[li]--
-                best = search(pos + 1, mask, idx, taken or (1 shl pos), n + 1, isMe, best)
-                cnt[li]++
-            }
-        }
-        return best
-    }
-
-    /** Sıra bende (seq[0] = true) iken tüm hamleleri dener; rootMoves dolar. */
-    fun solveRoot(mask: Int): Int {
-        rootMoves.clear()
-        return search(0, mask, 0, 0, 0, true, Int.MIN_VALUE)
-    }
-
-    /** En iyi hamle: önce değer, eşitse anlık puan, eşitse çok harf. */
-    fun bestRoot(): RootMove? {
-        var best: RootMove? = null
-        for (m in rootMoves) {
-            val b = best
-            if (b == null || m.value > b.value ||
-                (m.value == b.value && (m.gain > b.gain || (m.gain == b.gain && m.n > b.n)))
-            ) best = m
-        }
-        return best
-    }
-
-    fun valueOf(taken: Int): Int? {
-        for (m in rootMoves) if (m.taken == taken) return m.value
-        return null
-    }
-}
-
-private class Ev(val total: Double, val risk: Double)
-
-/**
- * Strateji:
- *  - SON 4 TUR: tüm hücrelerin harfi güvenle biliniyorsa kesin (minimax) hesap.
- *  - NORMAL FAZ: beklenen puan + rakibin kelime tamamlama riski (torbadaki harflerden
- *    hipergeometrik tahminle) + skora göre risk ayarı + harf değiştirme / pas kararı.
- *  - Oynanmayan her harf için NEDEN açıklanır (bilgi eksik mi, stratejik mi).
- */
-class Planner(private val st: GameState, private val cfg: PlannerConfig = PlannerConfig()) {
-    private val inf = Inference(st)
-    private val empties: List<CellPos> = st.emptyCells()
-    private val baseRefined: Map<WordSlot, List<Candidate>> = inf.refine(st.known)
-    private val baseDist: Map<CellPos, Map<Char, Double>> = empties.associateWith { inf.cellDist(it, baseRefined) }
-    private val guess = HashMap<CellPos, Char>()
-    private val guessP = HashMap<CellPos, Double>()
-
-    init {
-        for (c in empties) {
-            val d = baseDist[c]
-            if (d == null || d.isEmpty()) continue
-            var bl = ' '
-            var bp = 0.0
-            for ((l, p) in d) {
-                if (p > bp) { bp = p; bl = l }
-            }
-            if (bp >= 0.6) { guess[c] = bl; guessP[c] = bp }
-        }
-        logInference()
-    }
-
-    private var lastRiskInfo = ""
-
-    private fun logInference() {
-        try {
-            val sb = StringBuilder()
-            sb.append("PLANNER çıkarım: boş hücre=${empties.size}, bilinen harf=${st.known.size}, kesin tahmin (>=%60)=${guess.size}\n")
-            for (c in empties) {
-                val d = baseDist[c]
-                val txt = if (d == null || d.isEmpty()) "BİLGİ YOK"
-                else d.entries.sortedByDescending { it.value }.take(4).joinToString(" ") { "${it.key}:${(it.value * 100).toInt()}%" }
-                sb.append("  hücre ${cellLabel(c)} → $txt").append(if (guess.containsKey(c)) "  [tahmin ${guess[c]}]" else "").append("\n")
-            }
-            sb.append("yuva budama (aday sayısı: çözücüden → tahtayla budanmış):\n")
-            for (s in st.board.slots) {
-                if (st.emptyIn(s) == 0) continue
-                val raw = st.cands[s]?.size ?: 0
-                val ref = baseRefined[s]?.size ?: 0
-                sb.append("  ${slotLabel(s)} boş=${st.emptyIn(s)} aday=$raw → $ref").append(if (raw > 0 && ref == 0) "  !!! TAHTAYLA ÇELİŞİYOR" else "").append("\n")
-            }
-            GameLog.i("Planner", sb.toString())
-        } catch (ex: Throwable) {
-            GameLog.e("Planner", "çıkarım logu hatası", ex)
-        }
-    }
-
-    // ------------------------------------------------------------------ yardımcılar
-
-    private fun slotLabel(s: WordSlot): String {
-        val arrow = if (s.dir == Dir.ACROSS) "→" else "↓"
-        return "(${s.clueCell.r + 1},${s.clueCell.c + 1})$arrow${s.length}"
-    }
-
-    private fun cellLabel(c: CellPos): String = "(${c.r + 1},${c.c + 1})"
-
-    private fun choose(n: Int, k: Int): Double {
-        if (k < 0 || k > n) return 0.0
-        val kk = minOf(k, n - k)
-        var r = 1.0
-        for (i in 1..kk) r = r * (n - kk + i) / i
-        return r
-    }
-
-    /** Toplam u harften c tanesi "istenen" ise, d çekilişte en az need tanesinin gelme olasılığı. */
-    private fun atLeast(u: Int, c: Int, draws: Int, need: Int): Double {
-        if (need <= 0) return 1.0
-        val d = minOf(draws, u)
-        if (c < need || d < need) return 0.0
-        val total = choose(u, d)
-        if (total <= 0.0) return 0.0
-        var s = 0.0
-        for (k in need..minOf(c, d)) s += choose(c, k) * choose(u - c, d - k) / total
-        return s.coerceIn(0.0, 1.0)
-    }
-
-    private fun removeLetters(rack: List<Char>, used: List<Char>): List<Char> {
-        val m = rack.toMutableList()
-        for (u in used) m.remove(u)
-        return m
-    }
-
-    /** Görülmemiş (rakipte veya torbada olabilecek) harflerin sayımı. */
-    private fun unseenCounts(placed: Set<CellPos>, rackAfter: List<Char>): Map<Char, Int> {
-        val m = HashMap<Char, Int>()
-        for (c in empties) {
-            if (c in placed) continue
-            val g = guess[c] ?: continue
-            m[g] = (m[g] ?: 0) + 1
-        }
-        for (l in rackAfter) {
-            val v = (m[l] ?: 0) - 1
-            if (v > 0) m[l] = v else m.remove(l)
-        }
-        return m
+    /** Yeni oyun: skorları ve tur sırasını sıfırlar. */
+    fun resetGame(): String {
+        GameLog.section("YENİ OYUN (elle sıfırlama)")
+        GameLog.i("Game", "sıfırlanmadan önce: ${scoreLabel()} | ${turns.label}")
+        myScore = 0; oppScore = 0
+        prevFilled = null; prevPlan = null; prevRack = ""
+        oppLastPlayed = -1; oppSwapPending = 0; oppSwapApplied = 0
+        turns.reset()
+        return "Sıfırlandı. " + scoreLabel()
     }
 
     /**
-     * pop: harflerin çekileceği havuzun büyüklüğü, draws: o havuzdan çekilen harf sayısı.
-     * Rakibin her gerekli harfe sahip olma ihtimali hipergeometrik olarak hesaplanır.
+     * İki analiz arasında tahtaya eklenen hücrelerden puanları günceller.
+     * Raf değiştiyse ve önceki planımdaki hücreler dolduysa onlar benimdir; kalanlar rakibindir.
+     * Rakibin yanlış koyduğu (geri giden) harfler görünmez, gerekirse elle düzelt.
      */
-    private fun oppCompleteProb(rem: List<CellPos>, unseen: Map<Char, Int>, pop: Int, draws: Int): Double {
-        var unknown = 0
-        val need = HashMap<Char, Int>()
-        for (c in rem) {
-            val g = guess[c]
-            if (g == null) unknown++ else need[g] = (need[g] ?: 0) + 1
-        }
-        var p = 1.0
-        for ((l, n) in need) p *= atLeast(pop, minOf(unseen[l] ?: 0, pop), draws, n)
-        if (unknown > 0) p *= Math.pow(cfg.unknownHold, unknown.toDouble())
-        return p * cfg.oppKnows
-    }
-
-    /**
-     * Hamleden sonra rakibin tamamlayabileceği kelimelerin beklenen puanı.
-     *
-     * KURAL: rakibe harfler hemen tamamlanmaz, sırası gelince torbadan rastgele verilir.
-     * Rakibin sıradaki eli = ELDE TUTTUKLARI (held) + YENİ ÇEKTİKLERİ (fresh).
-     *  - Yeni çekilenler gerçekten rastgeledir (torbadan, hipergeometrik).
-     *  - Elde tutulanlar rakibin geçen tur OYNAMADIĞI harflerdir; zaten oynanabilecek bir hücreye
-     *    ait olsalardı oynardı. Bu yüzden çoğunlukla bizim aradığımız harf değildirler (heldMatch).
-     *  - Torba tamamen rakibe geçecekse (fresh >= pool) rakip kalan her harfi görür: kesin bilgi.
-     */
-    private fun totalRisk(placed: Set<CellPos>, rackAfter: List<Char>, ctx: TurnContext): Double {
-        if (ctx.opponentMovesAfterMe <= 0) { lastRiskInfo = "rakibin sonraki hamlesi yok → risk 0"; return 0.0 }
-        val unseen = unseenCounts(placed, rackAfter)
-        var u = empties.size - placed.size - rackAfter.size
-        val sumUnseen = unseen.values.sum()
-        if (u < sumUnseen) u = sumUnseen
-        if (u < 1) u = 1
-        val cap = maxOf(1, ctx.oppRackSize)
-        val held = minOf(ctx.oppHeld.coerceIn(0, cap), u)
-        val pool = u - held
-        val fresh = minOf(cap - held, pool)
-        val total = held + fresh
-        val absorbed = fresh >= pool
-        val w = if (absorbed) 1.0 else maxOf(cfg.heldMatch, held.toDouble() / u)
-        lastRiskInfo = "u=$u elde=$held torba=$pool yeniÇekilecek=$fresh toplamEl=$total torbaTamamenRakipte=$absorbed w=${GameLog.f(w)} görülmeyen=$unseen"
-        var risk = 0.0
-        for (slot in st.board.slots) {
-            val rem = ArrayList<CellPos>()
-            for (c in slot.cells) if (!st.isFilled(c) && c !in placed) rem.add(c)
-            if (rem.isEmpty() || rem.size > total) continue
-            val pRand = oppCompleteProb(rem, unseen, u, total)
-            val pFresh = if (rem.size <= fresh && pool > 0) oppCompleteProb(rem, unseen, pool, fresh) else 0.0
-            risk += slot.length * (w * pRand + (1.0 - w) * pFresh)
-        }
-        return risk
-    }
-
-    /** Öndeysen savunmacı, gerideysen cesur ol. */
-    private fun riskMul(ctx: TurnContext): Double {
-        val lead = ctx.myScore - ctx.oppScore
-        return (1.0 + lead / 40.0).coerceIn(0.75, 1.35)
-    }
-
-    private fun evalFull(pl: List<Placement>, rack: List<Char>, ctx: TurnContext): Ev {
-        var ev = 0.0
-        for (x in pl) ev += 2 * x.p - 1
-        val cells = HashMap<CellPos, Placement>()
-        for (x in pl) cells[x.cell] = x
-        for (slot in st.board.slots) {
-            val before = st.emptyIn(slot)
-            if (before == 0) continue
-            var mineCount = 0
-            var prod = 1.0
-            for (c in slot.cells) {
-                val x = cells[c]
-                if (x != null) { mineCount++; prod *= x.p }
-            }
-            if (mineCount > 0 && mineCount == before) ev += slot.length * prod
-        }
-        if (pl.size >= 5) {
-            var all = 1.0
-            for (x in pl) all *= x.p
-            ev += (if (pl.size >= 6) cfg.bonus6 else cfg.bonus5) * all
-        }
-        val placed: Set<CellPos> = cells.keys
-        val rackAfter = removeLetters(rack, pl.map { it.letter })
-        val riskAfter = totalRisk(placed, rackAfter, ctx)
-        val riskBefore = totalRisk(emptySet<CellPos>(), rack, ctx)
-        val risk = riskMul(ctx) * (riskAfter - riskBefore)
-        ev -= risk
-        // Son 4 ele önde girmek önemli.
-        if (!ctx.endgame && pl.isNotEmpty()) {
-            val e0 = empties.size
-            if (e0 >= ENDGAME_EMPTY_LIMIT && e0 - pl.size < ENDGAME_EMPTY_LIMIT) {
-                val leadAfter = ctx.myScore - ctx.oppScore + ev
-                if (leadAfter > 0) ev += cfg.leadEntryBonus else if (leadAfter < 0) ev -= cfg.leadEntryBonus
-            }
-        }
-        return Ev(ev, risk)
-    }
-
-    /** Torbadan gelecek taze bir harfin ortalama faydası (harf değiştirme kararı için). */
-    private fun freshValue(rack: List<Char>): Double {
-        val unseen = unseenCounts(emptySet<CellPos>(), rack)
-        val tot = unseen.values.sum()
-        if (tot <= 0) return 0.0
-        var v = 0.0
-        for ((l, n) in unseen) {
-            var mp = 0.0
-            for (c in empties) {
-                val p = baseDist[c]?.get(l) ?: 0.0
-                if (p > mp) mp = p
-            }
-            v += (n.toDouble() / tot) * maxOf(0.0, 2 * mp - 1)
-        }
-        return v
-    }
-
-    // ------------------------------------------------------------------ ana giriş
-
-    fun plan(rack: List<Char>, ctx: TurnContext): Plan {
-        val r = rack.map { it.uppercaseChar() }
-        GameLog.i("Planner", "plan() raf=${r.joinToString("")} endgame=${ctx.endgame} sıraUzunluğu=${ctx.seq.size} boşHücre=${empties.size} skor=${ctx.myScore}-${ctx.oppScore} torba=${ctx.poolSize} rakipElinde=${ctx.oppHeld}")
-        if (ctx.endgame && ctx.seq.isNotEmpty()) {
-            val ep = planEndgame(r, ctx)
-            if (ep != null) return ep
-            GameLog.i("Planner", "Son4 kesin hesap sonuç vermedi → sezgisel plana geçiliyor")
-        }
-        return planHeuristic(r, ctx)
-    }
-
-    // ------------------------------------------------------------------ SON 4: kesin hesap
-
-    /** Torba, rakibin bir sonraki çekilişinde boşalmıyorsa kesin (tam bilgili) hesap geçerli değildir. */
-    private fun poolBlocksExact(ctx: TurnContext): Boolean =
-        ctx.poolSize > maxOf(0, ctx.oppRackSize - ctx.oppHeld)
-
-    private fun endNull(msg: String): Plan? {
-        GameLog.i("Planner", "SON4 kesin hesap YAPILAMADI: $msg")
-        return null
-    }
-
-    private fun planEndgame(rack: List<Char>, ctx: TurnContext): Plan? {
-        val e = empties.size
-        if (e == 0 || e > 14 || rack.isEmpty() || !ctx.seq[0])
-            return endNull("boş hücre=$e (1..14 olmalı), raf boş mu=${rack.isEmpty()}, sıra bende mi=${ctx.seq[0]}")
-        // Kesin hesap için torba rakibin sıradaki çekilişinde tamamen boşalmalı (rakip kalan her harfi görür).
-        if (poolBlocksExact(ctx))
-            return endNull("torba boşalmıyor: torba=${ctx.poolSize} > rakibin çekeceği=${maxOf(0, ctx.oppRackSize - ctx.oppHeld)}")
-
-        val letterOf = CharArray(e)
-        for (i in 0 until e) {
-            val c = empties[i]
-            val g = guess[c] ?: return endNull("hücre ${cellLabel(c)} harfi belirsiz (tahmin yok)")
-            if ((guessP[c] ?: 0.0) < 0.75)
-                return endNull("hücre ${cellLabel(c)} tahmini %${((guessP[c] ?: 0.0) * 100).toInt()} < %75")
-            letterOf[i] = g
-        }
-        // Rafım, boş hücrelerin harfleriyle tutarlı olmalı (rakibin harfleri = kalanlar).
-        val need = HashMap<Char, Int>()
-        for (ch in letterOf) need[ch] = (need[ch] ?: 0) + 1
-        val have = HashMap<Char, Int>()
-        for (ch in rack) have[ch] = (have[ch] ?: 0) + 1
-        for ((ch, n) in have) if (n > (need[ch] ?: 0)) {
-            return endNull("rafımdaki '$ch' harfi ($n adet) boş hücrelerin harf tahminleriyle tutarsız (beklenen: ${need[ch] ?: 0})")
-        }
-
-        val cellIdx = HashMap<CellPos, Int>()
-        for (i in 0 until e) cellIdx[empties[i]] = i
-        val sm = ArrayList<Int>()
-        val sl = ArrayList<Int>()
-        for (slot in st.board.slots) {
-            var m = 0
-            for (c in slot.cells) {
-                val i = cellIdx[c]
-                if (i != null) m = m or (1 shl i)
-            }
-            if (m != 0) { sm.add(m); sl.add(slot.length) }
-        }
-
-        val solver = EndgameSolver(
-            letterOf, sm.toIntArray(), sl.toIntArray(), ctx.seq.toBooleanArray(),
-            rack, cfg.bonus5, cfg.bonus6
-        )
-        solver.solveRoot((1 shl e) - 1)
-        val best = solver.bestRoot() ?: return endNull("kök hamle bulunamadı")
-        GameLog.i("Planner", "SON4 kesin hesap: boş=$e raf=${rack.joinToString("")} sıra=${ctx.seq.joinToString("") { if (it) "B" else "R" }} kökHamle=${solver.rootMoves.size}\n            hücre harfleri: ${(0 until e).joinToString(" ") { "${cellLabel(empties[it])}=${letterOf[it]}" }}\n" +
-            solver.rootMoves.sortedByDescending { it.value }.take(8).joinToString("\n") { m ->
-                "  değer=${m.value} anlıkPuan=${m.gain} harf=${m.n} hamle=" +
-                    (0 until e).filter { ((m.taken shr it) and 1) == 1 }.joinToString(" ") { i -> "${letterOf[i]}→${cellLabel(empties[i])}" }
-            } + "\n  EN İYİ: değer=${best.value} anlıkPuan=${best.gain} harf=${best.n}")
-
-        val diffNow = ctx.myScore - ctx.oppScore
-        val finalDiff = diffNow + best.value
-        val placements = ArrayList<Placement>()
-        for (i in 0 until e) {
-            if (((best.taken shr i) and 1) == 1) placements.add(Placement(letterOf[i], empties[i], 1.0))
-        }
-
-        // Oynanmayan harflerin nedeni: koysaydım sonuç ne olurdu?
-        val usedBy = HashMap<Char, Int>()
-        for (pl in placements) usedBy[pl.letter] = (usedBy[pl.letter] ?: 0) + 1
-        val held = ArrayList<HeldLetter>()
-        for ((ch, n) in have) {
-            val left = n - (usedBy[ch] ?: 0)
-            if (left <= 0) continue
-            var alt = Int.MIN_VALUE
-            var altCell = -1
-            for (i in 0 until e) {
-                if (letterOf[i] != ch) continue
-                if (((best.taken shr i) and 1) == 1) continue
-                val v = solver.valueOf(best.taken or (1 shl i)) ?: continue
-                if (v > alt) { alt = v; altCell = i }
-            }
-            val reason: String
-            if (altCell < 0) {
-                reason = "SAKLA: koyabileceği boş hücre kalmadı"
-            } else {
-                val d = best.value - alt
-                val rc = cellLabel(empties[altCell])
-                reason = if (d > 0) "STRATEJİK SAKLA: ${rc} hücresine koyarsan son fark $d puan düşer"
-                else "SAKLA: ${rc} hücresine koysan da fark değişmez, saklamak daha güvenli"
-            }
-            for (k in 0 until left) held.add(HeldLetter(ch, reason))
-        }
-
-        val lines = ArrayList<String>()
-        lines.add("SON4 KESİN HESAP (${ctx.seq.size} tur, rakip her şeyi bilse bile):")
-        val sign = if (finalDiff > 0) "+" else ""
-        val verdict = if (finalDiff > 0) "KAZANIRSIN" else if (finalDiff < 0) "GERİDE KALIRSIN" else "BERABERE"
-        lines.add("  Beklenen son fark: $sign$finalDiff → $verdict")
-        if (placements.isEmpty()) lines.add("  Bu tur PAS en iyisi (rakibi harf oynamaya zorla).")
-        for (h in held) lines.add("  ${h.letter}: ${h.reason}")
-
-        val endPlan = Plan(placements, best.value.toDouble(), placements.isEmpty(), emptyList(), held, emptyList(), lines)
-        GameLog.i("Planner", "SON4 planı: $endPlan\n" + lines.joinToString("\n"))
-        return endPlan
-    }
-
-    // ------------------------------------------------------------------ NORMAL FAZ (ve belirsiz son4)
-
-    private fun planHeuristic(rack: List<Char>, ctx: TurnContext): Plan {
-        // 1) Açgözlü zincir: her adımda en olası (harf, hücre); seçileni "doğru" varsayıp yeniden çıkarım.
-        val base = HashMap<CellPos, Char>(st.known)
-        val assumed = HashMap<CellPos, Char>()
-        val left = rack.toMutableList()
-        val chosen = ArrayList<Placement>()
-        while (left.isNotEmpty() && chosen.size < 6) {
-            val refined = inf.refine(base + assumed)
-            var best: Placement? = null
-            for (cell in empties) {
-                if (cell in assumed) continue
-                val d = inf.cellDist(cell, refined)
-                for (l in left.distinct()) {
-                    val p = d[l] ?: 0.0
-                    val b0 = best
-                    if (b0 == null || p > b0.p) best = Placement(l, cell, p)
+    private fun trackScores(board: ParsedBoard, st: GameState, rack: List<Char>): String {
+        val filledNow: Set<CellPos> = board.cellsOf(CellKind.FILLED).toSet()
+        val pf = prevFilled
+        val oldPlan = prevPlan
+        val rackNow = rack.sorted().joinToString("")
+        var msg = ""
+        turnChanged = false
+        oppCellsNow = 0
+        GameLog.i("Score", "skor takibi: önceki doluluk=${pf?.size ?: "yok (ilk analiz)"} şimdi=${filledNow.size} raf=$rackNow önceki raf=${prevRack.ifEmpty { "yok" }} önceki plan=${oldPlan ?: "yok"}")
+        if (pf != null) {
+            val newCells = filledNow.filter { it !in pf }
+            GameLog.i("Score", "yeni dolan hücreler (${newCells.size}): ${newCells.joinToString(" ") { "(${it.r + 1},${it.c + 1})" }}")
+            if (newCells.isNotEmpty()) {
+                val iPlayed = oldPlan != null && oldPlan.placements.isNotEmpty() && rackNow != prevRack
+                GameLog.i("Score", "ben oynadım mı=$iPlayed (önceki plan yerleştirme=${oldPlan?.placements?.size ?: 0}, raf değişti=${rackNow != prevRack})")
+                val mine = HashSet<CellPos>()
+                if (iPlayed && oldPlan != null) {
+                    for (pl in oldPlan.placements) {
+                        if (pl.cell in newCells) {
+                            val k = st.known[pl.cell]
+                            if (k == null || k.uppercaseChar() == pl.letter.uppercaseChar()) mine.add(pl.cell)
+                        }
+                    }
+                }
+                val opp = HashSet<CellPos>()
+                for (c in newCells) if (c !in mine) opp.add(c)
+                GameLog.i("Score", "hücre sahipliği: benim=[${mine.joinToString(" ") { "(${it.r + 1},${it.c + 1})" }}] rakibin=[${opp.joinToString(" ") { "(${it.r + 1},${it.c + 1})" }}]")
+                // YENİ PUANLAMA: koyulan her harf +1; bir kelimeyi bitiren hamlede o kelimedeki
+                // harfler +2'şer (kelimenin tamamı için ayrıca puan yok).
+                // Kelimeyi bitiren: o kelimeye rakip dokunduysa rakip, yoksa ben.
+                val finMine = HashSet<CellPos>()
+                val finOpp = HashSet<CellPos>()
+                for (slot in board.slots) {
+                    var touched = false
+                    var oppTouched = false
+                    var complete = true
+                    for (c in slot.cells) {
+                        if (c !in filledNow) complete = false
+                        if (c in mine) touched = true
+                        if (c in opp) { touched = true; oppTouched = true }
+                    }
+                    if (complete && touched) {
+                        if (oppTouched) {
+                            for (c in slot.cells) if (c in opp) finOpp.add(c)
+                        } else {
+                            for (c in slot.cells) if (c in mine) finMine.add(c)
+                        }
+                        GameLog.i("Score", "yuva TAMAMLANDI ${slot.dir} ipucu(${slot.clueCell.r + 1},${slot.clueCell.c + 1}) uzunluk=${slot.length} → ${if (oppTouched) "rakip" else "ben"} bitirdi (bitiren harflerin her biri +$FINISH_LETTER_POINTS)")
+                    }
+                }
+                var dMine = mine.size + finMine.size * (FINISH_LETTER_POINTS - 1)
+                var dOpp = opp.size + finOpp.size * (FINISH_LETTER_POINTS - 1)
+                if (mine.size >= 6) dMine += BONUS_6_LETTERS else if (mine.size >= 5) dMine += BONUS_5_LETTERS
+                if (opp.size >= 6) dOpp += BONUS_6_LETTERS else if (opp.size >= 5) dOpp += BONUS_5_LETTERS
+                myScore += dMine
+                oppScore += dOpp
+                msg = "son hamleler: ben +$dMine, rakip +$dOpp"
+                GameLog.i("Score", "SKOR GÜNCELLENDİ: ben +$dMine (harf=${mine.size}, bitiren harf=${finMine.size}), rakip +$dOpp (harf=${opp.size}, bitiren harf=${finOpp.size}) → ben=$myScore rakip=$oppScore | rakibin son turda koyduğu harf=${opp.size}")
+                oppLastPlayed = opp.size       // rakibin elinde kalan harf = 6 - bu sayı
+                oppCellsNow = opp.size
+                turnChanged = true
+            } else if (prevRack.isNotEmpty() && rackNow != prevRack) {
+                if (oldPlan != null && oldPlan.swap.isNotEmpty()) {
+                    // Ben harf değiştirdim: bu benim hamlemdi, sıra rakibe geçti. Rakibin ne yaptığı henüz bilinmiyor
+                    // (yeni harf yok); rakibin elini etkileyen bir şey değişmedi.
+                    GameLog.i("Score", "tahtaya yeni harf yok, rafım değişti ve planım HARF DEĞİŞTİRMEKTİ → kendi değiştirmem (hamlem bitti, sıra rakipte)")
+                } else {
+                    // Tahtaya yeni harf gelmedi ama rafım değişti: yeni tur, rakip harf koymadı (pas/değiştirme).
+                    GameLog.i("Score", "tahtaya yeni harf yok ama raf değişti → rakip harf koymadı (pas/değiştirme)")
+                    oppLastPlayed = 0
+                    turnChanged = true
                 }
             }
-            val b = best
-            if (b == null || b.p <= 0.05) break
-            chosen.add(b)
-            assumed[b.cell] = b.letter
-            left.remove(b.letter)
         }
-
-        GameLog.i("Planner", "açgözlü zincir: " + (if (chosen.isEmpty()) "BOŞ (hiçbir harf için p>0.05 hücre yok)" else chosen.joinToString("  ") { "${it.letter}→${cellLabel(it.cell)} %${(it.p * 100).toInt()}" }))
-        val riskNow = totalRisk(emptySet<CellPos>(), rack, ctx)
-        GameLog.i("Planner", "rakip tamamlama riski şu an=${GameLog.f(riskNow)} riskÇarpanı=${GameLog.f(riskMul(ctx))} | $lastRiskInfo")
-        // 2) Zincirin TÜM alt kümelerini değerlendir (bazı harfleri saklamak daha iyi olabilir).
-        val k = chosen.size
-        var bestSub: List<Placement> = emptyList()
-        var bestEv = 0.0
-        val evals = ArrayList<Triple<String, Double, Double>>()
-        for (m in 1 until (1 shl k)) {
-            val sub = ArrayList<Placement>()
-            for (i in 0 until k) if (((m shr i) and 1) == 1) sub.add(chosen[i])
-            val ev = evalFull(sub, rack, ctx)
-            evals.add(Triple(sub.joinToString(" ") { "${it.letter}→${cellLabel(it.cell)}" }, ev.total, ev.risk))
-            if (ev.total > bestEv) { bestEv = ev.total; bestSub = sub }
-        }
-
-        GameLog.i("Planner", "alt küme değerlendirmesi (${evals.size} alt küme; EV = beklenen puan - risk; hiç oynamamak EV=0):\n" +
-            evals.sortedByDescending { it.second }.take(8).joinToString("\n") { "  [${it.first}] EV=${GameLog.f(it.second)} risk=${GameLog.f(it.third)}" } +
-            "\n  SEÇİLEN: EV=${GameLog.f(bestEv)} " + (if (bestSub.isEmpty()) "HİÇBİRİ (pas/değiştir)" else bestSub.joinToString(" ") { "${it.letter}→${cellLabel(it.cell)}" }))
-        // 3) Bilgi durumu
-        val unknownCells = empties.filter { baseDist[it].isNullOrEmpty() }
-        val unknownSlots = st.board.slots.filter { st.emptyIn(it) > 0 && st.cands[it].isNullOrEmpty() }
-        val conflictSlots = st.board.slots.filter {
-            st.emptyIn(it) > 0 && !st.cands[it].isNullOrEmpty() && baseRefined[it].isNullOrEmpty()
-        }
-
-        GameLog.i("Planner", "bilgi durumu: bilgisiz hücre=${unknownCells.size} [${unknownCells.joinToString(" ") { cellLabel(it) }}] kelimesiz yuva=${unknownSlots.size} [${unknownSlots.joinToString(" ") { slotLabel(it) }}] çelişen yuva=${conflictSlots.size} [${conflictSlots.joinToString(" ") { slotLabel(it) }}]")
-        // 4) Her rafta harf için en iyi hücre ihtimali
-        val bestP = HashMap<Char, Double>()
-        val bestCell = HashMap<Char, CellPos>()
-        for (l in rack.distinct()) {
-            for (c in empties) {
-                val p = baseDist[c]?.get(l) ?: 0.0
-                if (p > (bestP[l] ?: 0.0)) { bestP[l] = p; bestCell[l] = c }
-            }
-        }
-
-        GameLog.i("Planner", "rafta harf başına en iyi hücre: " + rack.distinct().joinToString("  ") { l -> "$l→${bestCell[l]?.let { c -> cellLabel(c) } ?: "-"} %${((bestP[l] ?: 0.0) * 100).toInt()}" })
-        GameLog.d("Planner", "harf değiştirme kontrolü: endgame=${ctx.endgame} torba=${ctx.poolSize} (>=2 gerekli) bilgisizHücre=${unknownCells.size} (<=${cfg.maxUnknownForSwap} gerekli)")
-        // 5) Harf değiştirme: ölü harfler çoksa ve oyun bu turdan az değer veriyorsa.
-        var swap: List<Char> = emptyList()
-        if (!ctx.endgame && ctx.poolSize >= 2 && unknownCells.size <= cfg.maxUnknownForSwap) {
-            val used = bestSub.map { it.letter }.toMutableList()
-            val dead = ArrayList<Char>()
-            for (l in rack) {
-                if (used.remove(l)) continue
-                if ((bestP[l] ?: 0.0) < 0.2) dead.add(l)
-            }
-            if (dead.size >= 2) {
-                val gain = dead.size * freshValue(rack) * 0.7
-                GameLog.i("Planner", "ölü harfler (en iyi ihtimal <%20): ${dead.joinToString("")} | değiştirme kazancı=${GameLog.f(gain)} vs en iyi EV+0.3=${GameLog.f(bestEv + 0.3)} → ${if (gain > bestEv + 0.3) "DEĞİŞTİR" else "değiştirme"}")
-                if (gain > bestEv + 0.3) swap = dead.take(ctx.poolSize)
-            }
-        }
-        val finalPl: List<Placement> = if (swap.isNotEmpty()) emptyList() else bestSub
-
-        // 6) Oynanmayan harflerin nedenleri
-        val held = ArrayList<HeldLetter>()
-        val usedL = finalPl.map { it.letter }.toMutableList()
-        val swapLeft = swap.toMutableList()
-        for (l in rack) {
-            if (usedL.remove(l)) continue
-            if (swapLeft.remove(l)) continue
-            val reason = if (swap.isNotEmpty()) "bu tur oynanmıyor (diğer harfler değiştiriliyor)"
-            else explainHold(l, finalPl, rack, ctx, bestP[l] ?: 0.0, bestCell[l], unknownCells.size)
-            held.add(HeldLetter(l, reason))
-        }
-
-        // 7) Ekran satırları
-        val lines = ArrayList<String>()
-        if (ctx.endgame) {
-            lines.add(
-                if (poolBlocksExact(ctx)) "Son4: torbada hâlâ harf var (≈${ctx.poolSize}), kesin hesap yapılamaz; tahminle oynanıyor."
-                else "Son4: kesin hesap yapılamadı (bazı hücrelerin harfi belirsiz), tahminle oynanıyor."
-            )
-        }
-        if (swap.isNotEmpty()) {
-            lines.add("Torbada ≈${ctx.poolSize} harf var; ${swap.joinToString(" ")} harflerini değiştir.")
-        } else if (finalPl.isEmpty()) {
-            lines.add(
-                if (unknownSlots.isNotEmpty()) "PAS nedeni: kelimesi bilinmeyen yuvalar var, güvenli hamle bulunamadı."
-                else "PAS nedeni: artı beklentili hamle yok."
-            )
-        }
-        for (h in held) lines.add("  ${h.letter}: ${h.reason}")
-        if (unknownSlots.isNotEmpty()) {
-            lines.add(
-                "Kelimesi BULUNAMAYAN yuva (${unknownSlots.size}): " +
-                    unknownSlots.take(4).joinToString(" ") { slotLabel(it) } +
-                    (if (unknownSlots.size > 4) " …" else "") + "  [sarı noktalı hücreler]"
-            )
-        }
-        if (conflictSlots.isNotEmpty()) {
-            lines.add(
-                "Adayı tahtayla ÇELİŞEN yuva (${conflictSlots.size}): " +
-                    conflictSlots.take(4).joinToString(" ") { slotLabel(it) }
-            )
-        }
-
-        val hp = Plan(finalPl, if (swap.isNotEmpty()) 0.0 else bestEv, finalPl.isEmpty() && swap.isEmpty(),
-            swap, held, unknownCells, lines)
-        GameLog.i("Planner", "SEZGİSEL plan: $hp\n" + lines.joinToString("\n"))
-        return hp
+        GameLog.i("Score", "takip sonucu: turnChanged=$turnChanged skor ben=$myScore rakip=$oppScore rakipSonOynadığı=$oppLastPlayed")
+        prevFilled = filledNow
+        prevRack = rackNow
+        prevPlan = null
+        return msg
     }
 
-    /** Harf neden oynanmadı? Bilgi eksikliği ile stratejiyi ayırır. */
-    private fun explainHold(
-        l: Char, plan: List<Placement>, rack: List<Char>, ctx: TurnContext,
-        p: Double, cell: CellPos?, unknownCount: Int
-    ): String {
-        if (p <= 0.0 || cell == null) {
-            return if (unknownCount > 0)
-                "BİLGİ YOK: kelimesi bulunamayan $unknownCount hücre var, bu harf oraya ait olabilir (strateji değil)"
-            else "hiçbir aday kelimede yok (oynanamaz)"
-        }
-        val rc = cellLabel(cell)
-        val pct = (p * 100).toInt()
-        if (p < cfg.minUsefulP) return "DÜŞÜK İHTİMAL: $rc için %$pct, riske değmez"
-        if (plan.any { it.cell == cell }) return "$rc hücresi başka harfle dolduruluyor, bu harf sonra"
-        val baseEv = evalFull(plan, rack, ctx)
-        val withIt = ArrayList<Placement>(plan)
-        withIt.add(Placement(l, cell, p))
-        val ev = evalFull(withIt, rack, ctx)
-        val d = ev.total - baseEv.total
-        val riskUp = ev.risk - baseEv.risk
-        if (riskUp > 0.25) {
-            val rs = "%.1f".format(riskUp)
-            return "STRATEJİK SAKLA: $rc %$pct ama rakibe kelime tamamlatır (risk +$rs)"
-        }
-        val ds = "%.1f".format(d)
-        return "STRATEJİK SAKLA: $rc %$pct ama koyarsan beklenen puan $ds"
-    }
-}
+    /** AI'a sorulması gereken yuva. */
+    private class Pending(val slot: WordSlot, val key: String, val pattern: String, val crop: Bitmap)
 
-/**
- * Tur bağlamı yardımcısı (eski kodla uyum için tutuldu).
- */
-object Phase {
-    fun context(st: GameState, myMovesLeft: Int, oppMovesAfterMyMove: Int) =
-        TurnContext(st.inEndgame(), myMovesLeft, oppMovesAfterMyMove)
+    private fun slotKey(s: WordSlot) = "${s.dir}${s.clueCell.r},${s.clueCell.c}:${s.length}"
+
+    /** Önbellek anahtarı: ipucu görüntüsünün parmak izi + cevap uzunluğu. */
+    private fun clueId(ckey: String, length: Int) = "$ckey#$length"
+
+    /** Tahtayı okumadan önce night light / ekran filtresini geri alır (filtre yoksa aynen döner). */
+    private fun prep(bmp: Bitmap): Bitmap = bmp.normalizeTint()
+
+    private fun slotName(s: WordSlot) = "${if (s.dir == Dir.ACROSS) "→" else "↓"}(${s.clueCell.r + 1},${s.clueCell.c + 1})×${s.length}"
+
+    private fun parseBoard(bmp: Bitmap): ParsedBoard {
+        val t0 = System.currentTimeMillis()
+        val board = parser.parse(BitmapPixelSource(bmp))
+        if (board == null) {
+            GameLog.e("Game", "IZGARA BULUNAMADI (ekran ${bmp.width}x${bmp.height}) - oyun ekranı açık mı?")
+            error("Izgara bulunamadı (oyun ekranı açık mı?)")
+        }
+        GameLog.i("Game", "ızgara ${System.currentTimeMillis() - t0}ms'de okundu: ${board.rows}x${board.cols}, ${board.slots.size} yuva")
+        return board
+    }
+
+    private fun candsText(c: List<Candidate>?): String =
+        if (c.isNullOrEmpty()) "ADAY YOK" else c.take(6).joinToString(",") { it.word + "(" + GameLog.f(it.weight) + ")" } + (if (c.size > 6) " …+${c.size - 6}" else "")
+
+    /** Yeni oyun mu? İpucu hücrelerinin düzeni büyük ölçüde değiştiyse her şeyi sıfırla. */
+    private fun syncSignature(board: ParsedBoard) {
+        val keys: Set<String> = board.slots.map { slotKey(it) }.toSet()
+        val sig = board.slots.joinToString("|") { slotKey(it) }
+        if (sig != signature) {
+            val denom = maxOf(1, maxOf(keys.size, lastSlotKeys.size))
+            val overlap = keys.intersect(lastSlotKeys).size.toDouble() / denom
+            val newGame = signature.isNotEmpty() && overlap < 0.5
+            GameLog.i("Game", "ızgara imzası değişti: yuva=${keys.size} önceki yuva=${lastSlotKeys.size} örtüşme=${GameLog.f(overlap)} → ${if (signature.isEmpty()) "ilk okuma" else if (newGame) "YENİ OYUN algılandı: skor/tur/rakip eli sıfırlandı" else "aynı oyun (okuma farkı), harf önbelleği temizlendi"}")
+            // Harfler konuma bağlı olduğu için yeni düzende sıfırlanır. İpucu önbellekleri
+            // (görüntüye bağlı) silinmez; sadece "yazı yok" listesi temizlenir.
+            signature = sig; lastSlotKeys = keys
+            letterCache.clear(); relaxedCells.clear(); ocrEmpty.clear()
+            if (newGame) {
+                turns.reset()
+                myScore = 0; oppScore = 0
+                prevFilled = null; prevPlan = null; prevRack = ""
+                oppLastPlayed = -1; oppSwapPending = 0; oppSwapApplied = 0
+            }
+        }
+    }
+
+    /**
+     * HARFLERİ TANI: Sadece harf okur (raf + tahta). Tanıyamadıklarını kullanıcıya sorar.
+     * AI kullanmaz, plan çıkarmaz.
+     */
+    suspend fun recognizeLetters(rawBmp: Bitmap, ask: AskLetter?, progress: (String) -> Unit = {}): LetterResult {
+        GameLog.section("HARFLERİ TANI (GameController)")
+        val bmp = prep(rawBmp)
+        progress("Izgara aranıyor…")
+        val board = parseBoard(bmp)
+        syncSignature(board)
+
+        val filled = board.cellsOf(CellKind.FILLED)
+        val need = filled.filter { it !in letterCache }
+        progress("Harfler okunuyor…")
+        val reading = letters.read(bmp, board, need, ask, includeRack = true, relaxBoard = true)
+        for (p in need) reading.letters[p]?.let { letterCache[p] = it }
+        relaxedCells.addAll(letters.lastRelaxed)
+        GameLog.i("Game", "tahta (okunan harflerle):\n" + board.dump(letterCache))
+
+        val lr = LetterResult(
+            rack = reading.rack,
+            boardFilled = filled.size,
+            boardKnown = filled.count { it in letterCache },
+            unresolved = letters.lastUnresolved,
+            rackMissing = letters.lastUnresolvedRack,
+            info = letters.lastRackInfo
+        )
+        GameLog.i("Game", "HARFLERİ TANI sonucu: raf=${lr.rack.joinToString("")} rafEksik=${lr.rackMissing} tahtaDolu=${lr.boardFilled} tahtaBilinen=${lr.boardKnown} çözülemeyen=${lr.unresolved} bilgi=[${lr.info}]")
+        return lr
+    }
+
+    /**
+     * ÖĞREN: Analiz yapmaz, plan çıkarmaz, ipucu çözdürmez, rafı okumaz.
+     * Sadece tahtadaki harfleri okur ve tamamen dolu yuvaları veritabanına kaydeder.
+     */
+    suspend fun learn(rawBmp: Bitmap, ask: AskLetter?, progress: (String) -> Unit = {}): LearnResult {
+        GameLog.section("ÖĞREN (GameController)")
+        val bmp = prep(rawBmp)
+        progress("Izgara aranıyor…")
+        val board = parseBoard(bmp)
+        syncSignature(board)
+
+        val filled = board.cellsOf(CellKind.FILLED)
+        // Daha önce gevşek eşleşmeyle okunmuş harfler güvenilmez: öğrenmeden önce sıkı şekilde yeniden okunur.
+        for (p in filled) if (p in relaxedCells) { letterCache.remove(p); relaxedCells.remove(p) }
+        val need = filled.filter { it !in letterCache }
+        progress("Harfler okunuyor…")
+        // Öğrenirken sıkı eşleşme: yanlış harften yanlış kelime kaydedilmesin.
+        val reading = letters.read(bmp, board, need, ask, includeRack = false, relaxBoard = false)
+        for (p in need) reading.letters[p]?.let { letterCache[p] = it }
+
+        val known = HashMap<CellPos, Char>()
+        for (p in filled) letterCache[p]?.let { known[p] = it }
+        GameLog.i("Learn", "tahta (okunan harflerle):\n" + board.dump(known))
+
+        progress("Veritabanına kaydediliyor…")
+        val before = db.size()
+        var full = 0
+        for (s in board.slots) {
+            if (s.cells.all { it in known }) {
+                full++
+                val word = s.cells.map { known[it]!! }.joinToString("")
+                val ck = db.key(bmp.crop(s.clueRect))
+                GameLog.d("Learn", "yuva ${slotName(s)} dolu → öğren: \"$word\" ipucu=${ClueDb.shortId(ck)}")
+                db.put(ck, word)
+            }
+        }
+        val after = db.size()
+        val unread = filled.count { it !in known }
+        GameLog.i("Learn", "ÖĞREN sonucu: dolu yuva=$full yeni kelime=${after - before} okunamayan hücre=$unread toplam kayıt=$after")
+        return LearnResult(full, after - before, unread, after)
+    }
+
+    /**
+     * ANALİZ: Harf sormaz (sadece kayıtlı şablonlarla okur).
+     * Sadece RAFTAKİ harfler okunamazsa durur. Tahtadaki tanınmayan hücreler yok sayılır.
+     * İpuçları: önce bellek, telefondaki veritabanı ve TDK sözlüğü.
+     * USE_AI açıksa kalanlar TEK TOPLU istekle AI'a sorulur; kapalıysa çözümsüz kalır.
+     */
+    suspend fun analyze(rawBmp: Bitmap, progress: (String) -> Unit = {}): Analysis {
+        runNo++
+        val tAll = System.currentTimeMillis()
+        GameLog.section("ANALİZ #$runNo (GameController)")
+        GameLog.i("Game", "analiz başlıyor | ${scoreLabel()} | tur: ${turns.label} | rakipSonOynadığı=$oppLastPlayed rakipDeğiştirdi(uygulanan)=$oppSwapApplied bekleyen=$oppSwapPending | önbellek: harf=${letterCache.size} aday=${candCache.size} ocr=${ocrCache.size} | ${GameLog.mem()}")
+        val bmp = prep(rawBmp)
+        progress("Izgara aranıyor…")
+        val board = parseBoard(bmp)
+        progress("Harfler okunuyor…")
+
+        syncSignature(board)
+        lastAiError = ""
+        tdkHits = 0
+        tdkDebug.clear()
+        var unsolvedNoAi = 0
+
+        val st = GameState(board)
+        val filled = board.cellsOf(CellKind.FILLED)
+        val need = filled.filter { it !in letterCache }
+        val reading = letters.read(bmp, board, need, null, includeRack = true, relaxBoard = true)   // null: kullanıcıya sorma
+        for (p in need) reading.letters[p]?.let { letterCache[p] = it }
+        relaxedCells.addAll(letters.lastRelaxed)
+        for (p in filled) letterCache[p]?.let { st.known[p] = it }
+        GameLog.i("Game", "tahta (okunan harflerle):\n" + board.dump(st.known))
+
+        // Raf tamamen okunamadıysa plan yapılamaz. Bir kısmı okunduysa kalan harflerle devam edilir
+        // ("Harfleri tanı" butonuna basmak zorunlu değil).
+        if (reading.rack.isEmpty()) GameLog.e("Game", "RAF OKUNAMADI: ${letters.lastRackInfo}")
+        if (reading.rack.isEmpty())
+            error("Raftaki harfler okunamadı.\n[${letters.lastRackInfo}]")
+        val rackUnread = letters.lastUnresolvedRack
+        GameLog.i("Game", "raf: ${reading.rack.joinToString("")} (okunamayan raf karosu=$rackUnread) | tahtada dolu=${filled.size} harfi bilinen=${filled.count { it in st.known }} gevşek okunan=${relaxedCells.size}")
+
+        // Skor takibi: önceki analizden bu yana tahtaya eklenenler.
+        val scoreMsg = trackScores(board, st, reading.rack)
+        if (oppSwapPending > 0) {
+            if (oppCellsNow > 0) {
+                // Rakip tahtaya harf koyduysa aynı turda harf değiştirmiş olamaz (hamle ya biri ya diğeri).
+                GameLog.w("Game", "rakip $oppCellsNow harf koymuş; 'harf değiştirdi' işareti ($oppSwapPending) yok sayıldı")
+                oppSwapApplied = 0
+            } else {
+                // Rakibin hamlesi harf değiştirmekti: tahtaya harf koymadı, sıra bana geçti.
+                oppSwapApplied = oppSwapPending
+                oppLastPlayed = 0
+                turnChanged = true
+            }
+            oppSwapPending = 0
+        }
+        else if (turnChanged) oppSwapApplied = 0
+        GameLog.d("Game", "rakip değiştirme: uygulanan=$oppSwapApplied bekleyen=$oppSwapPending turnChanged=$turnChanged")
+        st.myScore = myScore
+        st.oppScore = oppScore
+
+        val deadline = System.currentTimeMillis() + AI_TIME_LIMIT_MS
+
+        // ÖĞRENME: tamamen dolmuş yuvaların ipucu görüntüsünü ve cevabını telefona kaydet.
+        for (s in board.slots) {
+            // Gevşek eşleşmeyle okunmuş (emin olunmayan) harf içeren yuvalardan öğrenme.
+            if (s.cells.all { it in st.known && it !in relaxedCells }) {
+                val word = s.cells.map { st.known[it]!! }.joinToString("")
+                val ck = db.key(bmp.crop(s.clueRect))
+                GameLog.d("AutoLearn", "yuva ${slotName(s)} tamamen dolu → kaydedilecek: \"$word\" ipucu=${ClueDb.shortId(ck)}")
+                db.put(ck, word)
+            }
+        }
+
+        // İpucu çözümü: sadece henüz bitmemiş yuvalar.
+        val todo = board.slots.filter { st.emptyIn(it) > 0 }.sortedBy { st.emptyIn(it) }
+        progress("Raf: ${reading.rack.joinToString("")} — ${todo.size} ipucu kontrol ediliyor")
+        GameLog.i("Game", "çözülecek yuva: ${todo.size}/${board.slots.size} (tamamen dolu: ${board.slots.size - todo.size})")
+
+        // TDK sözlüğünü yükle (ilk seferde kısa sürer, sonra anında).
+        if (!tdk.ready) {
+            progress("TDK sözlüğü yükleniyor…")
+            tdk.prepare()
+            GameLog.i("Game", "TDK sözlüğü hazırlandı: ${tdk.ready} ${tdk.loadError}")
+        }
+
+        // 1. aşama: bellek + telefondaki veritabanı + TDK (kotasız).
+        val results = HashMap<WordSlot, List<Candidate>>()
+        val pending = ArrayList<Pending>()
+        for (s in todo) {
+            val pattern = s.cells.map { st.known[it] ?: '?' }.joinToString("")
+            val crop = bmp.crop(s.clueRect)
+            val ckey = db.key(crop)                 // ipucu görüntüsünün parmak izi (bir kez hesaplanır)
+            val key = clueId(ckey, s.length)
+            val local = localCands(s, key, ckey, pattern, crop)
+            if (local != null) results[s] = local else pending.add(Pending(s, key, pattern, crop))
+        }
+        GameLog.i("Game", "1. aşama (bellek/veritabanı/TDK): çözülen=${results.size} AI'a kalan=${pending.size} TDK ile çözülen=$tdkHits")
+        if (tdkHits > 0) progress("TDK ile $tdkHits ipucu çözüldü, ${pending.size} ipucu kaldı")
+
+        // 2. aşama: kalanlar (SON ÇARE: AI). Şalter kapalıysa AI'a hiç sorulmaz.
+        if (pending.isNotEmpty()) {
+            if (!USE_AI) {
+                unsolvedNoAi = pending.size
+                GameLog.w("Game", "AI kapalı: ${pending.size} ipucu çözümsüz bırakıldı: " + pending.joinToString(" ") { slotName(it.slot) })
+                for (p in pending) results[p.slot] = emptyList()
+            } else if (deadline - System.currentTimeMillis() < 3000) {
+                lastAiError = "süre doldu"
+                for (p in pending) results[p.slot] = emptyList()
+            } else {
+                progress("Yapay zekaya ${pending.size} ipucu toplu soruluyor…")
+                val answers = solver.solveBatch(
+                    pending.map { ClueQuery(it.crop.toPng(), it.slot.length, it.pattern) }, deadline
+                )
+                var missing = 0
+                pending.forEachIndexed { i, p ->
+                    val a = answers.getOrNull(i)
+                    if (a != null) {
+                        candCache[p.key] = a
+                        asked.add(p.key)        // cevap geldi: bu oyunda bir daha sorulmaz
+                        results[p.slot] = a
+                    } else {
+                        missing++               // asked'e eklenmez, sonraki analizde yeniden denenir
+                        results[p.slot] = emptyList()
+                    }
+                }
+                if (missing > 0) lastAiError = solver.lastError.ifEmpty { "bazı ipuçları için cevap gelmedi" }
+            }
+        }
+        for ((s, c) in results) st.cands[s] = c
+        GameLog.i("Game", "yuva adayları (nihai):\n" + board.slots.joinToString("\n") { s ->
+            "  ${slotName(s)} desen=${s.cells.map { st.known[it] ?: '?' }.joinToString("")} boş=${st.emptyIn(s)} → " + (if (st.emptyIn(s) == 0) "(dolu)" else candsText(st.cands[s]))
+        })
+
+        progress("Hamle planlanıyor…")
+        // Torba / rakip eli tahmini. Oyunda toplam harf sayısı = boş hücre sayısı.
+        // Rakibin eli: son turda oynamadığı harfler (6 - oynadığı - değiştirdiği); sırası gelince
+        // eksikleri torbadan rastgele çeker. Torba = benim dışımdaki harfler - rakibin eli.
+        val emptyCount = st.emptyCells().size
+        val myTiles = reading.rack.size + rackUnread
+        val rest = maxOf(0, emptyCount - myTiles)                  // rakip eli + torba
+        val histKnown = oppLastPlayed >= 0 || oppSwapApplied > 0
+        val heldEst = if (histKnown) (6 - maxOf(0, oppLastPlayed) - oppSwapApplied).coerceIn(0, 6) else 0
+        val oppHeld: Int       // rakibin şu an elinde tuttuğu harf sayısı
+        val pool: Int          // torbada kalan harf sayısı
+        if (myTiles < 6) {
+            // Rafım dolmadıysa torba bitmiştir; kalan her harf rakipte.
+            oppHeld = minOf(6, rest); pool = 0
+        } else if (histKnown) {
+            oppHeld = minOf(heldEst, rest); pool = rest - oppHeld
+        } else {
+            // Geçmiş bilinmiyor (ilk analiz): eski varsayım, rakip eli dolu sayılır.
+            oppHeld = 0; pool = maxOf(0, rest - 6)
+        }
+        val oppFresh = minOf(6 - oppHeld, pool)                    // rakibin sırası gelince çekeceği yeni harf
+        GameLog.i("Game", "torba/rakip eli tahmini: boşHücre=$emptyCount benimTaş=$myTiles (okunamayan=$rackUnread) kalan(rakipEli+torba)=$rest geçmişBilinir=$histKnown tahminiElde=$heldEst → rakipElinde=$oppHeld torba=$pool rakipYeniÇeker=$oppFresh")
+
+        val ctx = if (turns.endgame)
+            TurnContext(true, turns.myTurnsLeft.coerceAtLeast(1), turns.oppAfterNextMine,
+                myScore, oppScore, pool, 6, turns.seqFromMyNext, oppHeld)
+        else
+            TurnContext(false, 99, 1, myScore, oppScore, pool, 6, emptyList(), oppHeld)
+            GameLog.i("Game", "TurnContext: endgame=${ctx.endgame} benimKalanHamle=${ctx.myMovesLeft} sonrasıRakipHamle=${ctx.opponentMovesAfterMe} skor=${ctx.myScore}-${ctx.oppScore} torba=${ctx.poolSize} rakipElinde=${ctx.oppHeld} sıra=${ctx.seq.joinToString("") { if (it) "B" else "R" }}")
+
+        val tPlan = System.currentTimeMillis()
+        val plan = Planner(st).plan(reading.rack, ctx)
+        GameLog.i("Game", "PLAN (${System.currentTimeMillis() - tPlan}ms): $plan\nsatırlar:\n" + plan.lines.joinToString("\n"))
+        prevPlan = plan
+
+        val solved = board.slots.count { st.emptyIn(it) == 0 || !st.cands[it].isNullOrEmpty() }
+
+        // Ekranda gösterilecek kısa not: sadece işe yarar şeyler.
+        val note = buildString {
+            append(scoreLabel())
+            if (scoreMsg.isNotEmpty()) append(" ($scoreMsg)")
+            append("\nBoş hücre: $emptyCount · torba ≈ $pool")
+            if (histKnown || myTiles < 6) {
+                append(" · rakip elinde ≈ $oppHeld harf tutuyor, sırası gelince ≈ $oppFresh yeni harf çeker")
+                if (oppSwapApplied > 0) append(" (rakip $oppSwapApplied harf değiştirmiş)")
+            } else {
+                append(" · rakip eli bilinmiyor (ilk analiz; bir sonraki turdan itibaren takip edilir)")
+            }
+            if (turns.endgame) append("\n").append(turns.label)
+            if (rackUnread > 0) {
+                if (isNotEmpty()) append("\n")
+                append("Rafta $rackUnread karo okunamadı, kalan ${reading.rack.size} harfle planlandı.")
+            }
+            if (!turns.endgame && st.inEndgame()) append("\nBoş hücre azaldı: sıra kimdeyse 'Son4: ben' / 'Son4: rakip' butonuna bas (kesin hesap için gerekli).")
+            if (turns.endgame && !turns.nextIsMine && !turns.finished) append(" (rakibin hamlesini bekle)")
+            if (tdkHits > 0) {
+                if (isNotEmpty()) append("\n")
+                append("TDK ile çözülen: $tdkHits ipucu")
+            }
+            if (unsolvedNoAi > 0) {
+                if (isNotEmpty()) append("\n")
+                append("$unsolvedNoAi ipucu çözülemedi (yapay zeka kapalı).")
+            }
+            if (lastAiError.isNotEmpty()) {
+                if (isNotEmpty()) append("\n")
+                append("Yapay zeka cevap vermedi (kota dolmuş olabilir). Sonuç eksik, biraz sonra tekrar Analiz'e bas.")
+            }
+            if (DEBUG_TDK) {
+                if (isNotEmpty()) append("\n")
+                append("[TDK teşhis] sözlük: ")
+                if (tdk.ready) append("yüklü")
+                else append("YÜKLÜ DEĞİL (${tdk.loadError.ifEmpty { "sebep bilinmiyor" }})")
+                for (line in tdkDebug.take(8)) append("\n").append(line)
+                if (tdkDebug.size > 8) append("\n… +${tdkDebug.size - 8} ipucu daha")
+            }
+        }
+        GameLog.i("Game", "ANALİZ tamam: ${System.currentTimeMillis() - tAll}ms | çözülen yuva=$solved/${board.slots.size} | ${GameLog.mem()}\nekranda gösterilecek not:\n$note")
+        return Analysis(board, reading.rack, plan, note, solved, board.slots.size)
+    }
+
+    /**
+     * AI'sız çözüm: 1) bellek  2) telefondaki veritabanı  3) TDK sözlüğü.
+     * Liste dönerse yuva çözülmüştür (boş olabilir). null dönerse AI'a sorulmalıdır.
+     */
+    private suspend fun localCands(s: WordSlot, key: String, ckey: String, pattern: String, crop: Bitmap): List<Candidate>? {
+        fun fits(w: String) = w.indices.all { pattern[it] == '?' || pattern[it] == w[it] }
+
+        // 1) Bellek: kayıtlı adaylar, tahtadaki yeni harflere göre elenir.
+        candCache[key]?.let { c ->
+            val f = c.filter { fits(it.word) }
+            GameLog.d("Clue", "${slotName(s)} desen=$pattern ipucu=${ClueDb.shortId(ckey)}: bellekte ${c.size} aday, desene uyan ${f.size}${if (key in asked) " (AI sorulmuş)" else ""}")
+            if (f.isNotEmpty() || key in asked) return f   // AI zaten sorulduysa bir daha sorma
+        }
+
+        // 2) Telefondaki veritabanı
+        val hit = db.get(ckey, s.length).filter { fits(it) }
+        GameLog.d("Clue", "${slotName(s)} desen=$pattern ipucu=${ClueDb.shortId(ckey)}: veritabanı → ${if (hit.isEmpty()) "bulunamadı" else hit.joinToString(",")}")
+        if (hit.isNotEmpty()) {
+            if (DEBUG_TDK) tdkDebug.add("${s.length}h → kayıtlı veritabanından: ${hit.take(3).joinToString(",")}")
+            return hit.map { Candidate(it, 1.0) }.also { candCache[key] = it }
+        }
+
+        // 3) TDK sözlüğü: ipucu yazısı bir kez okunur (OCR), her seferinde güncel desenle aranır.
+        //    Güven düşükse / resimli ipucuysa null döner.
+        if (tdk.ready && key !in asked) {
+            var text = ocrCache[ckey]
+            if (text == null) {
+                text = if (ckey in ocrEmpty) "" else tdk.readClue(crop)
+                if (text.isEmpty()) ocrEmpty.add(ckey) else ocrCache[ckey] = text
+            }
+            val t = tdk.candidates(text, s.length, pattern)
+            GameLog.i("Clue", "${slotName(s)} desen=$pattern ipucu=${ClueDb.shortId(ckey)} OCR=\"${text.take(60)}\" → ${if (t == null) "TDK ÇÖZEMEDİ (${tdk.lastReason})" else "TDK çözdü: " + t.take(5).joinToString(",") { it.word }}")
+            if (DEBUG_TDK) tdkDebug.add("${s.length}h \"${text.take(40)}\" → ${tdk.lastReason}")
+            if (t != null) {
+                tdkHits++
+                return t
+            }
+        } else if (DEBUG_TDK && !tdk.ready) {
+            tdkDebug.add("${s.length}h → sözlük yüklü değil")
+        }
+
+        // 4) AI zaten sorulduysa tekrar sorma.
+        if (key in asked) return emptyList()
+        return null
+    }
 }
