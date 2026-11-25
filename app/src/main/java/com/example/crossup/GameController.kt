@@ -13,6 +13,32 @@ import com.example.crossup.ai.TdkMatcher
 import com.example.crossup.parser.*
 import java.util.concurrent.ConcurrentHashMap
 
+/**
+ * Kullanıcının kalemle yazdığı NOTLAR (tahmin harfleri). Oyunun kendisine yazılmaz, sadece
+ * ekranda bizim katmanda görünür. Analiz bunları "kullanıcının tahmini" diye kullanır.
+ */
+class NoteBook {
+    private val m = ConcurrentHashMap<CellPos, Char>()
+    val size get() = m.size
+    fun isEmpty() = m.isEmpty()
+    fun get(p: CellPos): Char? = m[p]
+    fun put(p: CellPos, ch: Char) { m[p] = ch }
+    fun remove(p: CellPos) { m.remove(p) }
+    fun clear() { m.clear() }
+    fun snapshot(): Map<CellPos, Char> = HashMap(m)
+
+    /** Artık boş olmayan (oyunda dolmuş) veya tahta dışında kalan hücrelerin notlarını siler. */
+    fun prune(board: ParsedBoard): Int {
+        var n = 0
+        for (p in m.keys.toList()) {
+            val ok = p.r in 0 until board.rows && p.c in 0 until board.cols &&
+                board.kinds[p.r][p.c] == CellKind.EMPTY
+            if (!ok) { m.remove(p); n++ }
+        }
+        return n
+    }
+}
+
 /** Son 4 tur sırası. Kullanıcı butonla başlatır; her turdan sonra "ilerle" ile bir adım atlanır. */
 class TurnTracker {
     var endgame = false; private set
@@ -94,6 +120,9 @@ class GameController(apiKey: String, ctx: Context) {
          * sözlüğün neden çözdüğü / çözemediği görünür. Sorun çözülünce false yap.
          */
         const val DEBUG_TDK = true
+
+        /** Notla uyuşan adayların ağırlığı bununla çarpılır (kullanıcının tahmini = güçlü ipucu, kesin değil). */
+        const val NOTE_BOOST = 3.0
     }
 
     private val parser = GridParser()
@@ -102,6 +131,14 @@ class GameController(apiKey: String, ctx: Context) {
     private val db = ClueDb.get(ctx)
     private val tdk = TdkMatcher(ctx)
     val turns = TurnTracker()
+
+    /** Kullanıcının kalem notları (tahmin harfleri). */
+    val notes = NoteBook()
+    /** false ise notlar ekranda kalır ama analizde KULLANILMAZ. */
+    @Volatile var useNotes = true
+
+    /** Okunmuş (tahtada duran) harf; bilinmiyorsa null. Not klavyesi kelime desenini göstermek için kullanır. */
+    fun letterAt(p: CellPos): Char? = letterCache[p]
 
         init {
             GameLog.i("Game", "GameController oluşturuldu: USE_AI=$USE_AI DEBUG_TDK=$DEBUG_TDK apiAnahtarı=${if (apiKey.isBlank()) "yok" else "var"} | kayıtlı kelime=${db.size()} | harf şablonu=${LetterDb.get(ctx).size()} | TDK yüklü=${tdk.ready}")
@@ -178,6 +215,7 @@ class GameController(apiKey: String, ctx: Context) {
         prevFilled = null; prevPlan = null; prevRack = ""
         oppLastPlayed = -1; oppSwapPending = 0; oppSwapApplied = 0
         turns.reset()
+        notes.clear()
         return "Sıfırlandı. " + scoreLabel()
     }
 
@@ -312,7 +350,75 @@ class GameController(apiKey: String, ctx: Context) {
                 myScore = 0; oppScore = 0
                 prevFilled = null; prevPlan = null; prevRack = ""
                 oppLastPlayed = -1; oppSwapPending = 0; oppSwapApplied = 0
+                notes.clear()
             }
+        }
+    }
+
+    /**
+     * NOT MODU için: sadece ızgarayı okur (harf okumaz, analiz yapmaz).
+     * Oyunda dolmuş hücrelerin eski notlarını siler.
+     */
+    fun readGrid(rawBmp: Bitmap): ParsedBoard {
+        GameLog.section("IZGARA OKU (not modu)")
+        val bmp = prep(rawBmp)
+        val board = parseBoard(bmp)
+        syncSignature(board)
+        val removed = notes.prune(board)
+        GameLog.i("Notes", "ızgara okundu: ${board.rows}x${board.cols}, not=${notes.size} (oyunda dolduğu için silinen=$removed)")
+        return board
+    }
+
+    /**
+     * Kullanıcı notlarını adaylara katar:
+     *  - Notla uyan aday varsa ağırlığı NOTE_BOOST ile çarpılır.
+     *  - Kelime notlarla tamamen yazılmışsa ve uyan aday yoksa, kullanıcının kelimesi aday olarak eklenir.
+     *  - Kısmi not sözlük adaylarıyla çelişiyorsa sözlüğe dokunulmaz (sadece sayılır).
+     * Dönen metin analiz notuna eklenir.
+     */
+    private fun applyNotes(st: GameState, board: ParsedBoard): String {
+        notes.prune(board)
+        val snap = notes.snapshot()
+        if (snap.isEmpty()) return ""
+        if (!useNotes) {
+            GameLog.i("Notes", "notlar var (${snap.size}) ama analizde KAPALI")
+            return "Notların (${snap.size} harf) bu analizde kullanılmadı (kapalı)."
+        }
+        var touched = 0; var boosted = 0; var added = 0; var conflict = 0
+        val conflictNames = ArrayList<String>()
+        for (s in board.slots) {
+            if (st.emptyIn(s) == 0) continue
+            val basePat = s.cells.map { st.known[it] ?: '?' }
+            val userPat = s.cells.mapIndexed { i, p -> if (basePat[i] != '?') basePat[i] else (snap[p] ?: '?') }
+            if (userPat == basePat) continue            // bu yuvada not yok
+            touched++
+            fun fits(w: String): Boolean {
+                val u = w.uppercase(TR)
+                return u.length == userPat.size && userPat.indices.all { userPat[it] == '?' || userPat[it] == u[it] }
+            }
+            val cur = st.cands[s].orEmpty()
+            val match = cur.filter { fits(it.word) }
+            val complete = userPat.none { it == '?' }
+            if (match.isNotEmpty()) {
+                st.cands[s] = cur.map { if (fits(it.word)) Candidate(it.word, it.weight * NOTE_BOOST) else it }
+                boosted++
+                GameLog.i("Notes", "${slotName(s)} notla uyan ${match.size} aday güçlendirildi (desen=${userPat.joinToString("")})")
+            } else if (complete) {
+                val w = userPat.joinToString("")
+                val top = cur.maxOfOrNull { it.weight } ?: 1.0
+                st.cands[s] = cur + Candidate(w, top)
+                added++
+                GameLog.i("Notes", "${slotName(s)} senin kelimen aday olarak eklendi: $w (ağırlık=${GameLog.f(top)})")
+            } else if (cur.isNotEmpty()) {
+                conflict++; conflictNames.add(slotName(s))
+                GameLog.i("Notes", "${slotName(s)} kısmi not (${userPat.joinToString("")}) sözlük adaylarıyla çelişiyor")
+            }
+        }
+        return buildString {
+            append("Notların: ${snap.size} harf, $touched yuvada")
+            if (boosted > 0) append(" · $boosted yuvada tahminin sözlükle uyuştu (güçlendirildi)")
+            if (added > 0) append(" · $added yuvada kendi kelimen aday eklendi")
+            if (conflict > 0) append(" · $conflict yuvada sözlükle ÇELİŞİYOR: ${conflictNames.take(4).joinToString(" ")}")
         }
     }
 
@@ -517,6 +623,7 @@ class GameController(apiKey: String, ctx: Context) {
             }
         }
         for ((s, c) in results) st.cands[s] = c
+        val noteInfo = applyNotes(st, board)
         GameLog.i("Game", "yuva adayları (nihai):\n" + board.slots.joinToString("\n") { s ->
             "  ${slotName(s)} desen=${s.cells.map { st.known[it] ?: '?' }.joinToString("")} boş=${st.emptyIn(s)} → " + (if (st.emptyIn(s) == 0) "(dolu)" else candsText(st.cands[s]))
         })
@@ -570,6 +677,7 @@ class GameController(apiKey: String, ctx: Context) {
                 append(" · rakip eli bilinmiyor (ilk analiz; bir sonraki turdan itibaren takip edilir)")
             }
             if (turns.endgame) append("\n").append(turns.label)
+            if (noteInfo.isNotEmpty()) append("\n").append(noteInfo)
             if (rackUnread > 0) {
                 if (isNotEmpty()) append("\n")
                 append("Rafta $rackUnread karo okunamadı, kalan ${reading.rack.size} harfle planlandı.")
@@ -647,3 +755,6 @@ class GameController(apiKey: String, ctx: Context) {
         return null
     }
 }
+
+
+
