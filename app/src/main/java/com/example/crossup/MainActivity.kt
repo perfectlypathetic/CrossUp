@@ -36,9 +36,12 @@ class MainActivity : Activity() {
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
+        GameLog.init(this)
+        GameLog.i("Main", "MainActivity.onCreate | sürüm v${BuildConfig.BUILD_NUMBER}")
         val prefs = getSharedPreferences("p", Context.MODE_PRIVATE)
         keyBox = EditText(this).apply { hint = "Gemini API anahtarı (AI Studio)"; setText(prefs.getString("key", "")) }
         val go = Button(this).apply { text = "Başlat"; setOnClickListener {
+            GameLog.i("Main", "BUTON: Başlat (üstteGösterme izni=${Settings.canDrawOverlays(this@MainActivity)}, API anahtarı ${if (keyBox.text.toString().isBlank()) "YOK" else "var"})")
             prefs.edit().putString("key", keyBox.text.toString().trim()).apply()
             if (!Settings.canDrawOverlays(this@MainActivity)) {
                 startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
@@ -59,6 +62,7 @@ class MainActivity : Activity() {
         val cloudNew = Button(this).apply {
             text = "Bulut: yeni dosya oluştur (ilk cihaz)"
             setOnClickListener {
+                GameLog.i("Main", "BUTON: Bulut yeni dosya")
                 startActivityForResult(
                     Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
                         addCategory(Intent.CATEGORY_OPENABLE)
@@ -73,6 +77,7 @@ class MainActivity : Activity() {
         val cloudPick = Button(this).apply {
             text = "Bulut: mevcut dosyayı seç (diğer cihaz)"
             setOnClickListener {
+                GameLog.i("Main", "BUTON: Bulut mevcut dosya")
                 startActivityForResult(
                     Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                         addCategory(Intent.CATEGORY_OPENABLE)
@@ -83,12 +88,34 @@ class MainActivity : Activity() {
                 )
             }
         }
+        val logShare = Button(this).apply {
+            text = "Logu paylaş / gönder"
+            setOnClickListener {
+                GameLog.i("Main", "BUTON: Logu paylaş")
+                GameLog.share(this@MainActivity) { m ->
+                    Toast.makeText(this@MainActivity, m, Toast.LENGTH_LONG).show()
+                    refreshInfo()
+                }
+            }
+        }
+        val logClear = Button(this).apply {
+            text = "Eski logları sil"
+            setOnClickListener {
+                GameLog.i("Main", "BUTON: Eski logları sil")
+                GameLog.clearOld(this@MainActivity) { m ->
+                    Toast.makeText(this@MainActivity, m, Toast.LENGTH_LONG).show()
+                    refreshInfo()
+                }
+            }
+        }
+
         setContentView(ScrollView(this).apply {
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40)
                 addView(keyBox); addView(go); addView(info)
                 addView(updInfo)
                 addView(cloudNew); addView(cloudPick)
+                addView(logShare); addView(logClear)
             })
         })
         // Güncelleme kontrolü onResume'da otomatik yapılır (uygulama her açıldığında).
@@ -108,6 +135,8 @@ class MainActivity : Activity() {
             runOnUiThread {
                 if (isFinishing) return@runOnUiThread
                 val rel = result.getOrNull()
+                if (rel == null) GameLog.w("Update", "kontrol başarısız: ${result.exceptionOrNull()?.message}")
+                else GameLog.i("Update", "kontrol: son=${rel.tag} şu an=v${BuildConfig.BUILD_NUMBER} yeni=${rel.isNewer}")
                 if (rel == null) {
                     updInfo.text = "Güncelleme kontrolü başarısız: ${result.exceptionOrNull()?.message}"
                 } else if (rel.isNewer) {
@@ -133,6 +162,7 @@ class MainActivity : Activity() {
     }
 
     private fun startUpdate(rel: Updater.Release) {
+        GameLog.i("Update", "güncelleme başlatıldı: ${rel.tag} (kurulum izni=${packageManager.canRequestPackageInstalls()})")
         if (!packageManager.canRequestPackageInstalls()) {
             pendingRel = rel   // izin verilip geri dönünce güncelleme kendiliğinden devam eder
             startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
@@ -148,6 +178,7 @@ class MainActivity : Activity() {
                 runOnUiThread { updInfo.text = "Yükleme ekranı açılıyor…" }
                 Updater.install(this, apk)
             } catch (e: Exception) {
+                GameLog.e("Update", "güncelleme hatası", e)
                 runOnUiThread { updInfo.text = "Güncelleme hatası: ${e.message}" }
             } finally {
                 updating = false
@@ -200,15 +231,18 @@ class MainActivity : Activity() {
             "Kayıtlı harf şablonu: ${LetterDb.get(this).size()}\n" +
             tdkLine + "\n" +
             cloud + "\n" +
-            "API anahtarı buluta kaydedilmez, yeni cihazda elle yapıştır."
+            "API anahtarı buluta kaydedilmez, yeni cihazda elle yapıştır.\n" +
+            GameLog.statusLine()
     }
 
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
         super.onActivityResult(req, res, data)
+        GameLog.i("Main", "onActivityResult istek=$req sonuç=${if (res == RESULT_OK) "TAMAM" else res.toString()} veri=${data != null}")
         if (res != RESULT_OK || data == null) return
 
         when (req) {
             REQ_PROJECTION -> {
+                GameLog.i("Main", "ekran yakalama izni verildi → servis başlatılıyor")
                 startForegroundService(Intent(this, CaptureService::class.java)
                     .putExtra("code", res).putExtra("data", data).putExtra("key", keyBox.text.toString().trim()))
                 moveTaskToBack(true)   // Bundle'a geç
