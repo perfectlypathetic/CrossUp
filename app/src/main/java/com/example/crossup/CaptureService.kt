@@ -18,6 +18,11 @@ import com.example.crossup.GameLog
 import com.example.crossup.ai.TR_ALPHABET
 import com.example.crossup.game.Analysis
 import com.example.crossup.game.GameController
+import com.example.crossup.parser.CellKind
+import com.example.crossup.parser.CellPos
+import com.example.crossup.parser.Dir
+import com.example.crossup.parser.ParsedBoard
+import com.example.crossup.parser.WordSlot
 import kotlinx.coroutines.*
 import kotlin.coroutines.resume
 
@@ -40,6 +45,19 @@ class CaptureService : Service() {
     private lateinit var status: TextView
     private lateinit var markers: MarkerView
     private var busy = false
+
+    // ---------- Not (kalem) modu ----------
+    private lateinit var markersLp: WindowManager.LayoutParams
+    private var kb: LinearLayout? = null
+    private var kbLp: WindowManager.LayoutParams? = null
+    private var kbInfo: TextView? = null
+    private lateinit var btnShowNotes: Button
+    private lateinit var btnUseNotes: Button
+    private var noteMode = false
+    private var noteDir = Dir.ACROSS
+    private var noteSel: CellPos? = null
+    private var noteBoard: ParsedBoard? = null
+    private var lastClearTap = 0L
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -130,7 +148,10 @@ class CaptureService : Service() {
     // ---------- overlay ----------
     private fun setOverlayVisible(v: Boolean) {
         val vis = if (v) View.VISIBLE else View.INVISIBLE
-        panel.visibility = vis; markers.visibility = vis
+        // Not modunda ana panel GONE olmalı (INVISIBLE kalırsa penceresi dokunuşları yutar).
+        panel.visibility = if (noteMode) View.GONE else vis
+        markers.visibility = vis
+        kb?.visibility = vis
     }
 
     private fun btn(t: String, onClick: () -> Unit) = Button(this).apply {
@@ -146,14 +167,17 @@ class CaptureService : Service() {
     private fun setupOverlay() {
         val type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         markers = MarkerView(this)
-        wm.addView(markers, WindowManager.LayoutParams(-1, -1, type,
+        markers.onTap = { x, y -> onBoardTap(x, y) }
+        // Normalde dokunulamaz (oyuna dokunuşlar geçer). Sadece not modunda dokunulabilir olur.
+        markersLp = WindowManager.LayoutParams(-1, -1, type,
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT).apply {
                 gravity = Gravity.TOP or Gravity.START
                 // Çentikli ekranlarda işaretlerin kaymaması için tüm ekranı kapla.
                 layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-            })
+            }
+        wm.addView(markers, markersLp)
 
         status = object : TextView(this@CaptureService) {
             override fun setText(text: CharSequence?, type: android.widget.TextView.BufferType?) {
@@ -177,6 +201,22 @@ class CaptureService : Service() {
             orientation = LinearLayout.HORIZONTAL
             addView(btn("Harfleri tanı") { recognize() })
             addView(btn("Öğren (kaydet)") { learn() })
+            addView(btn("✏ Not") { enterNoteMode() })
+        }
+        // Not ayarları: notları göster/gizle, analizde kullan/kullanma.
+        btnShowNotes = btn("👁 Notlar: görünür") {
+            markers.showNotes = !markers.showNotes
+            btnShowNotes.text = if (markers.showNotes) "👁 Notlar: görünür" else "👁 Notlar: gizli"
+            markers.invalidate()
+        }
+        btnUseNotes = btn("Analizde: açık") {
+            controller.useNotes = !controller.useNotes
+            btnUseNotes.text = if (controller.useNotes) "Analizde: açık" else "Analizde: kapalı"
+        }
+        val rowNotes = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btnShowNotes)
+            addView(btnUseNotes)
         }
 
         // Skor düzeltme satırları (rakibin yanlış harfleri gibi görünmeyen puanlar için).
@@ -193,7 +233,7 @@ class CaptureService : Service() {
             addView(btn("Rkp −1") { status.text = controller.adjustScore(false, -1) })
             addView(btn("Rkp +1") { status.text = controller.adjustScore(false, 1) })
             addView(btn("Rkp +5") { status.text = controller.adjustScore(false, 5) })
-            addView(btn("Yeni oyun") { status.text = controller.resetGame(); markers.clear() })
+            addView(btn("Yeni oyun") { status.text = controller.resetGame(); markers.clear(); refreshNotes() })
         }
 
         // Rakip son turunda harf DEĞİŞTİRDİYSE (tahtada görünmez) bas, sonra Analiz'e bas.
@@ -240,7 +280,7 @@ class CaptureService : Service() {
 
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(0xCC000000.toInt()); setPadding(16, 0, 16, 8)
-            addView(handle); addView(scroll); addView(row); addView(row2); addView(rowMe); addView(rowOpp); addView(rowSwap)
+            addView(handle); addView(scroll); addView(row); addView(row2); addView(rowNotes); addView(rowMe); addView(rowOpp); addView(rowSwap)
         }
         wm.addView(panel, panelLp)
         GameLog.i("Overlay", "panel eklendi: x=${panelLp.x} y=${panelLp.y} genişlik=${panelLp.width}")
@@ -409,6 +449,7 @@ class CaptureService : Service() {
     /** Sonucu göster: ekranda koyulacak harfler işaretlenir, panelde plan ve nedenler yazar. */
     private fun show(a: Analysis) {
         markers.set(a)
+        refreshNotes()
         val p = a.plan
         val moves = when {
             p.swap.isNotEmpty() -> "HARF DEĞİŞTİR: " + p.swap.joinToString(" ")
@@ -427,6 +468,267 @@ class CaptureService : Service() {
         }
     }
 
+    // =====================================================================
+    //  NOT (KALEM) MODU
+    //  - "✏ Not" → tahta okunur, ekranın altında harf klavyesi açılır.
+    //  - Hücreye dokun → seç; harfe bas → yazılır, sonraki boş hücreye geçer.
+    //  - İpucu (yeşil) hücresine dokun → o kelimenin ilk hücresi seçilir.
+    //  - Seçili hücreye tekrar dokun → yön değişir (→ / ↓).
+    //  - "Bitti" → katman dokunuşa kapanır, oyunu normal oynarsın; notlar ekranda kalır.
+    //  - Ekran yakalanırken notlar zaten gizlenir (overlay kapanır), analiz bozulmaz.
+    // =====================================================================
+
+    private fun refreshNotes() {
+        markers.notes = controller.notes.snapshot()
+        markers.invalidate()
+    }
+
+    private fun setMarkersTouchable(t: Boolean) {
+        markersLp.flags = if (t) markersLp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        else markersLp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        runCatching { wm.updateViewLayout(markers, markersLp) }
+    }
+
+    private fun enterNoteMode() {
+        if (busy) { GameLog.w("Notes", "NOT isteği yok sayıldı: başka işlem sürüyor"); return }
+        busy = true; status.text = "Tahta okunuyor…"
+        scope.launch {
+            GameLog.section("NOT MODU AÇILIYOR (tuş)")
+            try {
+                val bmp = capture("not")
+                val b = withContext(Dispatchers.Default) { controller.readGrid(bmp) }
+                noteBoard = b
+                markers.board = b
+                markers.showNotes = true
+                btnShowNotes.text = "👁 Notlar: görünür"
+                val keep = noteSel
+                noteSel = if (keep != null && b.kinds[keep.r][keep.c] == CellKind.EMPTY) keep
+                    else b.cellsOf(CellKind.EMPTY).firstOrNull()
+                noteMode = true
+                showKeyboard()
+                setMarkersTouchable(true)
+                setOverlayVisible(true)
+                ensureDirValid()
+                refreshNoteUi()
+                GameLog.i("Notes", "not modu açıldı: not=${controller.notes.size}")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                android.util.Log.e("CrossUp", "enterNoteMode", e)
+                GameLog.e("Notes", "NOT MODU HATASI", e)
+                noteMode = false
+                status.text = "Hata: ${e.message ?: e.javaClass.simpleName}"
+            } finally { busy = false }
+        }
+    }
+
+    private fun exitNoteMode() {
+        noteMode = false
+        noteSel = null
+        markers.selected = null; markers.wordCells = emptyList()
+        setMarkersTouchable(false)
+        kb?.let { v -> runCatching { wm.removeView(v) } }
+        kb = null; kbLp = null; kbInfo = null
+        refreshNotes()
+        setOverlayVisible(true)
+        status.text = "Not modu kapandı. ${controller.notes.size} harf not kayıtlı (ekranda mavi görünür).\n" +
+            "Sıran gelince oyunu normal oyna; Analiz'e basınca notların tahmin olarak dikkate alınır."
+        GameLog.i("Notes", "not modu kapandı: not=${controller.notes.size}")
+    }
+
+    private fun currentSlot(): WordSlot? {
+        val b = noteBoard ?: return null
+        val sel = noteSel ?: return null
+        return b.slots.firstOrNull { it.dir == noteDir && sel in it.cells }
+    }
+
+    /** Seçili hücre bu yönde bir kelimede değilse, diğer yöne geç. */
+    private fun ensureDirValid() {
+        if (currentSlot() != null) return
+        val b = noteBoard ?: return
+        val sel = noteSel ?: return
+        val other = if (noteDir == Dir.ACROSS) Dir.DOWN else Dir.ACROSS
+        if (b.slots.any { it.dir == other && sel in it.cells }) noteDir = other
+    }
+
+    private fun onBoardTap(x: Float, y: Float) {
+        if (!noteMode) return
+        val b = noteBoard ?: return
+        var hit: CellPos? = null
+        loop@ for (r in 0 until b.rows) for (c in 0 until b.cols) {
+            val rc = b.cellRects[r][c]
+            if (x >= rc.x0 && x < rc.x1 && y >= rc.y0 && y < rc.y1) { hit = CellPos(r, c); break@loop }
+        }
+        val h = hit ?: return
+        when (b.kinds[h.r][h.c]) {
+            CellKind.EMPTY -> {
+                if (noteSel == h) {
+                    // aynı hücreye tekrar dokunuş: yön değiştir (diğer yönde kelime varsa)
+                    val other = if (noteDir == Dir.ACROSS) Dir.DOWN else Dir.ACROSS
+                    if (b.slots.any { it.dir == other && h in it.cells }) noteDir = other
+                } else {
+                    noteSel = h
+                    ensureDirValid()
+                }
+            }
+            CellKind.CLUE -> {
+                val slots = b.slots.filter { it.clueCell == h }
+                if (slots.isEmpty()) return
+                val cur = currentSlot()
+                val pick = if (cur != null && cur in slots && slots.size > 1) slots.first { it != cur }
+                    else (slots.firstOrNull { it.dir == noteDir } ?: slots.first())
+                noteDir = pick.dir
+                noteSel = pick.cells.firstOrNull { b.kinds[it.r][it.c] == CellKind.EMPTY }
+            }
+            CellKind.FILLED -> return
+        }
+        refreshNoteUi()
+    }
+
+    private fun typeLetter(ch: Char) {
+        val b = noteBoard ?: return
+        val sel = noteSel ?: return
+        controller.notes.put(sel, ch)
+        val slot = currentSlot()
+        if (slot != null) {
+            val i = slot.cells.indexOf(sel)
+            val next = slot.cells.drop(i + 1).firstOrNull { b.kinds[it.r][it.c] == CellKind.EMPTY }
+            if (next != null) noteSel = next
+        }
+        refreshNoteUi()
+    }
+
+    private fun backspace() {
+        val b = noteBoard ?: return
+        val sel = noteSel ?: return
+        if (controller.notes.get(sel) != null) {
+            controller.notes.remove(sel)
+        } else {
+            val slot = currentSlot()
+            if (slot != null) {
+                val i = slot.cells.indexOf(sel)
+                val prev = slot.cells.take(i).lastOrNull { b.kinds[it.r][it.c] == CellKind.EMPTY }
+                if (prev != null) { noteSel = prev; controller.notes.remove(prev) }
+            }
+        }
+        refreshNoteUi()
+    }
+
+    /** Seçimi, notları ve klavyedeki bilgi satırını günceller. */
+    private fun refreshNoteUi() {
+        val b = noteBoard
+        val slot = currentSlot()
+        markers.selected = noteSel
+        markers.wordCells = slot?.cells ?: emptyList()
+        markers.notes = controller.notes.snapshot()
+        markers.invalidate()
+        val arrow = if (noteDir == Dir.ACROSS) "→" else "↓"
+        val info = StringBuilder()
+        val sel = noteSel
+        if (sel != null) info.append("Seçili: satır ${sel.r + 1}, sütun ${sel.c + 1}  $arrow")
+        else info.append("Bir boş hücreye dokun")
+        if (slot != null && b != null) {
+            val pat = slot.cells.joinToString(" ") { p ->
+                when (b.kinds[p.r][p.c]) {
+                    CellKind.FILLED -> (controller.letterAt(p) ?: '•').toString()
+                    else -> (controller.notes.get(p) ?: '_').toString()
+                }
+            }
+            info.append("   ·   ${slot.length} harf:  ").append(pat)
+        }
+        info.append("   ·   not: ${controller.notes.size}")
+        kbInfo?.text = info.toString()
+    }
+
+    private fun showKeyboard() {
+        kb?.let { v -> runCatching { wm.removeView(v) } }
+        val dm = resources.displayMetrics
+        val d = dm.density
+        val screenH = wm.currentWindowMetrics.bounds.height()
+
+        fun key(label: String, w: Float = 1f, onClick: () -> Unit) = Button(this).apply {
+            text = label; textSize = 15f; isAllCaps = false
+            minWidth = 0; minimumWidth = 0; minHeight = 0; minimumHeight = 0
+            setPadding(0, 0, 0, 0)
+            layoutParams = LinearLayout.LayoutParams(0, (40 * d).toInt(), w).apply { setMargins(1, 1, 1, 1) }
+            setOnClickListener { onClick() }
+        }
+
+        val info = TextView(this).apply {
+            setTextColor(Color.WHITE); textSize = 12f
+            setPadding(8, 0, 8, 6)
+        }
+        kbInfo = info
+
+        val handle = TextView(this).apply {
+            text = "⠿ sürükle (klavyeyi taşı) ⠿"; setTextColor(0xFFBBBBBB.toInt()); textSize = 11f
+            gravity = Gravity.CENTER; setPadding(0, 8, 0, 8)
+        }
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(0xEE000000.toInt()); setPadding(6, 0, 6, 6)
+            addView(handle); addView(info)
+            for (chunk in TR_ALPHABET.chunked(10)) {
+                val r = LinearLayout(this@CaptureService).apply { orientation = LinearLayout.HORIZONTAL }
+                for (c in chunk) r.addView(key(c.toString()) { typeLetter(c) })
+                addView(r)
+            }
+            val ctl = LinearLayout(this@CaptureService).apply { orientation = LinearLayout.HORIZONTAL }
+            ctl.addView(key("→ / ↓", 1.3f) {
+                val b = noteBoard
+                val sel = noteSel
+                if (b != null && sel != null) {
+                    val other = if (noteDir == Dir.ACROSS) Dir.DOWN else Dir.ACROSS
+                    if (b.slots.any { it.dir == other && sel in it.cells }) noteDir = other
+                }
+                refreshNoteUi()
+            })
+            ctl.addView(key("⌫", 1f) { backspace() })
+            val clearBtn = key("Hepsini sil", 1.5f) {}
+            clearBtn.setOnClickListener {
+                val now = System.currentTimeMillis()
+                if (now - lastClearTap < 3000) {
+                    controller.notes.clear(); lastClearTap = 0L
+                    clearBtn.text = "Hepsini sil"
+                    refreshNoteUi()
+                } else {
+                    lastClearTap = now
+                    clearBtn.text = "Emin misin?"
+                    clearBtn.postDelayed({ clearBtn.text = "Hepsini sil" }, 3000)
+                }
+            }
+            ctl.addView(clearBtn)
+            ctl.addView(key("Bitti", 1.2f) { exitNoteMode() })
+            addView(ctl)
+        }
+
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0; y = (screenH - 240 * d).toInt().coerceAtLeast(0)
+        }
+        kbLp = lp
+
+        var sy = 0; var oy = 0f
+        handle.setOnTouchListener { _, e ->
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> { sy = lp.y; oy = e.rawY }
+                MotionEvent.ACTION_MOVE -> {
+                    lp.y = (sy + (e.rawY - oy).toInt()).coerceIn(0, screenH - (60 * d).toInt())
+                    runCatching { wm.updateViewLayout(box, lp) }
+                }
+            }
+            true
+        }
+        wm.addView(box, lp)
+        kb = box
+    }
+
     private fun notification(): Notification {
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel("cap", "CrossUp", NotificationManager.IMPORTANCE_LOW))
@@ -437,6 +739,7 @@ class CaptureService : Service() {
     override fun onDestroy() {
         GameLog.section("SERVİS KAPANIYOR")
         scope.cancel()
+        kb?.let { v -> runCatching { wm.removeView(v) } }
         runCatching { wm.removeView(panel); wm.removeView(markers) }
         synchronized(lock) { held?.close(); held = null }
         vd?.release(); reader?.close(); projection?.stop(); thread.quitSafely()
@@ -449,18 +752,63 @@ class CaptureService : Service() {
 /**
  * Hücrelerin üstüne çizer (ekran görüntüsü koordinatı = ekran koordinatı).
  * Planın önerdiği hamleler: kırmızı daire içinde koyulacak harf. Bilgisi olmayan hücreler: sarı nokta.
+ * Kullanıcı notları: hücrede mavi (kalem) harf. Not modunda seçili kelime sarı, seçili hücre turuncu çerçeve.
+ * Dokunulabilirlik pencere bayrağıyla (FLAG_NOT_TOUCHABLE) servis tarafından açılıp kapanır.
  */
 class MarkerView(ctx: Context) : View(ctx) {
     private var a: Analysis? = null
+    /** En son bilinen tahta (analizden veya not modundan); notları çizmek için gerekir. */
+    var board: ParsedBoard? = null
+    var notes: Map<CellPos, Char> = emptyMap()
+    var showNotes = true
+    var selected: CellPos? = null
+    var wordCells: List<CellPos> = emptyList()
+    var onTap: ((Float, Float) -> Unit)? = null
+
     private val bg = Paint().apply { color = 0xCCE53935.toInt(); style = Paint.Style.FILL }
     private val tx = Paint().apply { color = Color.WHITE; textAlign = Paint.Align.CENTER; isFakeBoldText = true; isAntiAlias = true }
     // Kelimesi bilinmeyen (bilgi yok) hücreler: küçük sarı nokta.
     private val unk = Paint().apply { color = 0xCCFFC107.toInt(); style = Paint.Style.FILL; isAntiAlias = true }
+    private val wordTint = Paint().apply { color = 0x55FFEB3B.toInt(); style = Paint.Style.FILL }
+    private val selFill = Paint().apply { color = 0x66FF9800.toInt(); style = Paint.Style.FILL }
+    private val selLine = Paint().apply { color = 0xFFFF6D00.toInt(); style = Paint.Style.STROKE; strokeWidth = 5f }
+    private val noteBg = Paint().apply { color = 0x2E1565C0.toInt(); style = Paint.Style.FILL }
+    private val noteTx = Paint().apply { color = 0xFF0D47A1.toInt(); textAlign = Paint.Align.CENTER; isFakeBoldText = true; isAntiAlias = true }
 
-    fun set(x: Analysis) { a = x; invalidate() }
+    fun set(x: Analysis) { a = x; board = x.board; invalidate() }
     fun clear() { a = null; invalidate() }
 
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (e.action == MotionEvent.ACTION_DOWN) onTap?.invoke(e.x, e.y)
+        return true
+    }
+
     override fun onDraw(c: Canvas) {
+        val b = board
+        if (b != null) {
+            // Seçili kelime ve seçili hücre (sadece not modunda doludur).
+            for (p in wordCells) {
+                val r = b.cellRects[p.r][p.c]
+                c.drawRect(r.x0.toFloat(), r.y0.toFloat(), r.x1.toFloat(), r.y1.toFloat(), wordTint)
+            }
+            selected?.let { p ->
+                val r = b.cellRects[p.r][p.c]
+                c.drawRect(r.x0.toFloat(), r.y0.toFloat(), r.x1.toFloat(), r.y1.toFloat(), selFill)
+                c.drawRect(r.x0.toFloat() + 3f, r.y0.toFloat() + 3f, r.x1.toFloat() - 3f, r.y1.toFloat() - 3f, selLine)
+            }
+            // Kullanıcı notları: sadece hâlâ BOŞ olan hücrelerde.
+            if (showNotes) {
+                for ((p, ch) in notes) {
+                    if (p.r !in 0 until b.rows || p.c !in 0 until b.cols) continue
+                    if (b.kinds[p.r][p.c] != CellKind.EMPTY) continue
+                    val r = b.cellRects[p.r][p.c]
+                    c.drawRect(r.x0.toFloat() + 2f, r.y0.toFloat() + 2f, r.x1.toFloat() - 2f, r.y1.toFloat() - 2f, noteBg)
+                    val cx = (r.x0 + r.x1) / 2f; val cy = (r.y0 + r.y1) / 2f
+                    noteTx.textSize = (r.x1 - r.x0) * 0.62f
+                    c.drawText(ch.toString(), cx, cy + noteTx.textSize * 0.35f, noteTx)
+                }
+            }
+        }
         val an = a ?: return
         for (uc in an.plan.unknownCells) {
             val r = an.board.cellRects[uc.r][uc.c]
