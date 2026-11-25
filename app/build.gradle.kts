@@ -20,6 +20,19 @@ android {
 
         buildConfigField("int", "BUILD_NUMBER", buildNumber.toString())
         buildConfigField("String", "GH_REPO", "\"$ghRepo\"")
+
+        // APK küçültme 1: sadece modern telefon (arm64) için derle.
+        // ML Kit her işlemci türü için ayrı büyük kütüphane koyuyordu (4 kopya).
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+    }
+
+    // APK küçültme 2: kütüphaneleri APK içinde sıkıştırılmış tut (indirme boyutu düşer).
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 
     buildFeatures {
