@@ -2,11 +2,13 @@ package com.example.crossup.game
 
 import android.content.Context
 import android.graphics.Bitmap
+import com.example.crossup.GameLog
 import com.example.crossup.ai.AskLetter
 import com.example.crossup.ai.ClueDb
 import com.example.crossup.ai.ClueQuery
 import com.example.crossup.ai.GeminiClueSolver
 import com.example.crossup.ai.LetterReader
+import com.example.crossup.ai.LetterDb
 import com.example.crossup.ai.TdkMatcher
 import com.example.crossup.parser.*
 import java.util.concurrent.ConcurrentHashMap
@@ -20,16 +22,18 @@ class TurnTracker {
     fun start(meFirst: Boolean) {
         seq = if (meFirst) listOf(true, false, true, false) else listOf(false, true, false, true)
         idx = 0; endgame = true
+        GameLog.i("Turns", "Son4 başlatıldı: ilk sıra ${if (meFirst) "BENDE" else "RAKİPTE"} → sıra=${seq.joinToString("") { if (it) "B" else "R" }}")
     }
 
     /** Sırayı bir adım ilerletir. Son 4 başlamadıysa veya bittiyse false döner. */
     fun advance(): Boolean {
         if (!endgame || idx >= seq.size) return false
         idx++
+        GameLog.i("Turns", "sıra ilerletildi → $label")
         return true
     }
 
-    fun reset() { endgame = false; seq = emptyList(); idx = 0 }
+    fun reset() { endgame = false; seq = emptyList(); idx = 0; GameLog.i("Turns", "tur takibi sıfırlandı") }
 
     val finished get() = endgame && idx >= seq.size
     val nextIsMine get() = seq.getOrNull(idx) == true
@@ -99,6 +103,10 @@ class GameController(apiKey: String, ctx: Context) {
     private val tdk = TdkMatcher(ctx)
     val turns = TurnTracker()
 
+        init {
+            GameLog.i("Game", "GameController oluşturuldu: USE_AI=$USE_AI DEBUG_TDK=$DEBUG_TDK apiAnahtarı=${if (apiKey.isBlank()) "yok" else "var"} | kayıtlı kelime=${db.size()} | harf şablonu=${LetterDb.get(ctx).size()} | TDK yüklü=${tdk.ready}")
+        }
+
     private var signature = ""
     private val letterCache = HashMap<CellPos, Char>()
     /** Harfi GEVŞEK eşleşmeyle okunmuş (emin olunmayan) hücreler: bunlardan kelime öğrenilmez. */
@@ -138,10 +146,12 @@ class GameController(apiKey: String, ctx: Context) {
     private var oppSwapApplied = 0
     /** Bu analizde yeni bir tur algılandı mı (tahtaya harf eklendi veya raf değişti). */
     private var turnChanged = false
+    private var runNo = 0
 
     /** Rakip son turunda harf değiştirdiyse (tahtada görünmez) her basışta +1; 6'dan sonra sıfırlanır. */
     fun addOppSwap(): String {
         oppSwapPending = if (oppSwapPending >= 6) 0 else oppSwapPending + 1
+        GameLog.i("Game", "BUTON etkisi: rakip harf değiştirdi → bekleyen değişim=$oppSwapPending (bir sonraki Analiz'de uygulanır)")
         return if (oppSwapPending == 0) "Rakip harf değiştirmedi olarak işaretlendi."
         else "Rakip son turda $oppSwapPending harf değiştirdi. (Şimdi Analiz'e bas.)"
     }
@@ -151,11 +161,14 @@ class GameController(apiKey: String, ctx: Context) {
     /** Elle skor düzeltme (rakibin yanlış harfleri gibi görünmeyen şeyler için). */
     fun adjustScore(me: Boolean, delta: Int): String {
         if (me) myScore += delta else oppScore += delta
+        GameLog.i("Score", "elle skor düzeltme: ${if (me) "ben" else "rakip"} ${if (delta > 0) "+" else ""}$delta → ${scoreLabel()}")
         return scoreLabel()
     }
 
     /** Yeni oyun: skorları ve tur sırasını sıfırlar. */
     fun resetGame(): String {
+        GameLog.section("YENİ OYUN (elle sıfırlama)")
+        GameLog.i("Game", "sıfırlanmadan önce: ${scoreLabel()} | ${turns.label}")
         myScore = 0; oppScore = 0
         prevFilled = null; prevPlan = null; prevRack = ""
         oppLastPlayed = -1; oppSwapPending = 0; oppSwapApplied = 0
@@ -175,10 +188,13 @@ class GameController(apiKey: String, ctx: Context) {
         val rackNow = rack.sorted().joinToString("")
         var msg = ""
         turnChanged = false
+        GameLog.i("Score", "skor takibi: önceki doluluk=${pf?.size ?: "yok (ilk analiz)"} şimdi=${filledNow.size} raf=$rackNow önceki raf=${prevRack.ifEmpty { "yok" }} önceki plan=${oldPlan ?: "yok"}")
         if (pf != null) {
             val newCells = filledNow.filter { it !in pf }
+            GameLog.i("Score", "yeni dolan hücreler (${newCells.size}): ${newCells.joinToString(" ") { "(${it.r + 1},${it.c + 1})" }}")
             if (newCells.isNotEmpty()) {
                 val iPlayed = oldPlan != null && oldPlan.placements.isNotEmpty() && rackNow != prevRack
+                GameLog.i("Score", "ben oynadım mı=$iPlayed (önceki plan yerleştirme=${oldPlan?.placements?.size ?: 0}, raf değişti=${rackNow != prevRack})")
                 val mine = HashSet<CellPos>()
                 if (iPlayed && oldPlan != null) {
                     for (pl in oldPlan.placements) {
@@ -190,6 +206,7 @@ class GameController(apiKey: String, ctx: Context) {
                 }
                 val opp = HashSet<CellPos>()
                 for (c in newCells) if (c !in mine) opp.add(c)
+                GameLog.i("Score", "hücre sahipliği: benim=[${mine.joinToString(" ") { "(${it.r + 1},${it.c + 1})" }}] rakibin=[${opp.joinToString(" ") { "(${it.r + 1},${it.c + 1})" }}]")
                 var dMine = mine.size
                 var dOpp = opp.size
                 for (slot in board.slots) {
@@ -203,6 +220,7 @@ class GameController(apiKey: String, ctx: Context) {
                     }
                     if (complete && touched) {
                         if (oppTouched) dOpp += slot.length else dMine += slot.length
+                        GameLog.i("Score", "yuva TAMAMLANDI ${slot.dir} ipucu(${slot.clueCell.r + 1},${slot.clueCell.c + 1}) uzunluk=${slot.length} → ${if (oppTouched) "rakibe" else "bana"} +${slot.length}")
                     }
                 }
                 if (mine.size >= 6) dMine += 6 else if (mine.size >= 5) dMine += 5
@@ -210,14 +228,17 @@ class GameController(apiKey: String, ctx: Context) {
                 myScore += dMine
                 oppScore += dOpp
                 msg = "son hamleler: ben +$dMine, rakip +$dOpp"
+                GameLog.i("Score", "SKOR GÜNCELLENDİ: ben +$dMine (5/6 harf bonusu dahil), rakip +$dOpp → ben=$myScore rakip=$oppScore | rakibin son turda koyduğu harf=${opp.size}")
                 oppLastPlayed = opp.size       // rakibin elinde kalan harf = 6 - bu sayı
                 turnChanged = true
             } else if (prevRack.isNotEmpty() && rackNow != prevRack) {
                 // Tahtaya yeni harf gelmedi ama rafım değişti: yeni tur, rakip harf koymadı (pas/değiştirme).
+                GameLog.i("Score", "tahtaya yeni harf yok ama raf değişti → rakip harf koymadı (pas/değiştirme)")
                 oppLastPlayed = 0
                 turnChanged = true
             }
         }
+        GameLog.i("Score", "takip sonucu: turnChanged=$turnChanged skor ben=$myScore rakip=$oppScore rakipSonOynadığı=$oppLastPlayed")
         prevFilled = filledNow
         prevRack = rackNow
         prevPlan = null
@@ -235,6 +256,22 @@ class GameController(apiKey: String, ctx: Context) {
     /** Tahtayı okumadan önce night light / ekran filtresini geri alır (filtre yoksa aynen döner). */
     private fun prep(bmp: Bitmap): Bitmap = bmp.normalizeTint()
 
+    private fun slotName(s: WordSlot) = "${if (s.dir == Dir.ACROSS) "→" else "↓"}(${s.clueCell.r + 1},${s.clueCell.c + 1})×${s.length}"
+
+    private fun parseBoard(bmp: Bitmap): ParsedBoard {
+        val t0 = System.currentTimeMillis()
+        val board = parser.parse(BitmapPixelSource(bmp))
+        if (board == null) {
+            GameLog.e("Game", "IZGARA BULUNAMADI (ekran ${bmp.width}x${bmp.height}) - oyun ekranı açık mı?")
+            error("Izgara bulunamadı (oyun ekranı açık mı?)")
+        }
+        GameLog.i("Game", "ızgara ${System.currentTimeMillis() - t0}ms'de okundu: ${board.rows}x${board.cols}, ${board.slots.size} yuva")
+        return board
+    }
+
+    private fun candsText(c: List<Candidate>?): String =
+        if (c.isNullOrEmpty()) "ADAY YOK" else c.take(6).joinToString(",") { it.word + "(" + GameLog.f(it.weight) + ")" } + (if (c.size > 6) " …+${c.size - 6}" else "")
+
     /** Yeni oyun mu? İpucu hücrelerinin düzeni büyük ölçüde değiştiyse her şeyi sıfırla. */
     private fun syncSignature(board: ParsedBoard) {
         val keys: Set<String> = board.slots.map { slotKey(it) }.toSet()
@@ -243,6 +280,7 @@ class GameController(apiKey: String, ctx: Context) {
             val denom = maxOf(1, maxOf(keys.size, lastSlotKeys.size))
             val overlap = keys.intersect(lastSlotKeys).size.toDouble() / denom
             val newGame = signature.isNotEmpty() && overlap < 0.5
+            GameLog.i("Game", "ızgara imzası değişti: yuva=${keys.size} önceki yuva=${lastSlotKeys.size} örtüşme=${GameLog.f(overlap)} → ${if (signature.isEmpty()) "ilk okuma" else if (newGame) "YENİ OYUN algılandı: skor/tur/rakip eli sıfırlandı" else "aynı oyun (okuma farkı), harf önbelleği temizlendi"}")
             // Harfler konuma bağlı olduğu için yeni düzende sıfırlanır. İpucu önbellekleri
             // (görüntüye bağlı) silinmez; sadece "yazı yok" listesi temizlenir.
             signature = sig; lastSlotKeys = keys
@@ -261,9 +299,10 @@ class GameController(apiKey: String, ctx: Context) {
      * AI kullanmaz, plan çıkarmaz.
      */
     suspend fun recognizeLetters(rawBmp: Bitmap, ask: AskLetter?, progress: (String) -> Unit = {}): LetterResult {
+        GameLog.section("HARFLERİ TANI (GameController)")
         val bmp = prep(rawBmp)
         progress("Izgara aranıyor…")
-        val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
+        val board = parseBoard(bmp)
         syncSignature(board)
 
         val filled = board.cellsOf(CellKind.FILLED)
@@ -272,8 +311,9 @@ class GameController(apiKey: String, ctx: Context) {
         val reading = letters.read(bmp, board, need, ask, includeRack = true, relaxBoard = true)
         for (p in need) reading.letters[p]?.let { letterCache[p] = it }
         relaxedCells.addAll(letters.lastRelaxed)
+        GameLog.i("Game", "tahta (okunan harflerle):\n" + board.dump(letterCache))
 
-        return LetterResult(
+        val lr = LetterResult(
             rack = reading.rack,
             boardFilled = filled.size,
             boardKnown = filled.count { it in letterCache },
@@ -281,6 +321,8 @@ class GameController(apiKey: String, ctx: Context) {
             rackMissing = letters.lastUnresolvedRack,
             info = letters.lastRackInfo
         )
+        GameLog.i("Game", "HARFLERİ TANI sonucu: raf=${lr.rack.joinToString("")} rafEksik=${lr.rackMissing} tahtaDolu=${lr.boardFilled} tahtaBilinen=${lr.boardKnown} çözülemeyen=${lr.unresolved} bilgi=[${lr.info}]")
+        return lr
     }
 
     /**
@@ -288,9 +330,10 @@ class GameController(apiKey: String, ctx: Context) {
      * Sadece tahtadaki harfleri okur ve tamamen dolu yuvaları veritabanına kaydeder.
      */
     suspend fun learn(rawBmp: Bitmap, ask: AskLetter?, progress: (String) -> Unit = {}): LearnResult {
+        GameLog.section("ÖĞREN (GameController)")
         val bmp = prep(rawBmp)
         progress("Izgara aranıyor…")
-        val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
+        val board = parseBoard(bmp)
         syncSignature(board)
 
         val filled = board.cellsOf(CellKind.FILLED)
@@ -304,6 +347,7 @@ class GameController(apiKey: String, ctx: Context) {
 
         val known = HashMap<CellPos, Char>()
         for (p in filled) letterCache[p]?.let { known[p] = it }
+        GameLog.i("Learn", "tahta (okunan harflerle):\n" + board.dump(known))
 
         progress("Veritabanına kaydediliyor…")
         val before = db.size()
@@ -311,11 +355,15 @@ class GameController(apiKey: String, ctx: Context) {
         for (s in board.slots) {
             if (s.cells.all { it in known }) {
                 full++
-                db.put(db.key(bmp.crop(s.clueRect)), s.cells.map { known[it]!! }.joinToString(""))
+                val word = s.cells.map { known[it]!! }.joinToString("")
+                val ck = db.key(bmp.crop(s.clueRect))
+                GameLog.d("Learn", "yuva ${slotName(s)} dolu → öğren: \"$word\" ipucu=${ClueDb.shortId(ck)}")
+                db.put(ck, word)
             }
         }
         val after = db.size()
         val unread = filled.count { it !in known }
+        GameLog.i("Learn", "ÖĞREN sonucu: dolu yuva=$full yeni kelime=${after - before} okunamayan hücre=$unread toplam kayıt=$after")
         return LearnResult(full, after - before, unread, after)
     }
 
@@ -326,9 +374,13 @@ class GameController(apiKey: String, ctx: Context) {
      * USE_AI açıksa kalanlar TEK TOPLU istekle AI'a sorulur; kapalıysa çözümsüz kalır.
      */
     suspend fun analyze(rawBmp: Bitmap, progress: (String) -> Unit = {}): Analysis {
+        runNo++
+        val tAll = System.currentTimeMillis()
+        GameLog.section("ANALİZ #$runNo (GameController)")
+        GameLog.i("Game", "analiz başlıyor | ${scoreLabel()} | tur: ${turns.label} | rakipSonOynadığı=$oppLastPlayed rakipDeğiştirdi(uygulanan)=$oppSwapApplied bekleyen=$oppSwapPending | önbellek: harf=${letterCache.size} aday=${candCache.size} ocr=${ocrCache.size} | ${GameLog.mem()}")
         val bmp = prep(rawBmp)
         progress("Izgara aranıyor…")
-        val board = parser.parse(BitmapPixelSource(bmp)) ?: error("Izgara bulunamadı (oyun ekranı açık mı?)")
+        val board = parseBoard(bmp)
         progress("Harfler okunuyor…")
 
         syncSignature(board)
@@ -344,17 +396,21 @@ class GameController(apiKey: String, ctx: Context) {
         for (p in need) reading.letters[p]?.let { letterCache[p] = it }
         relaxedCells.addAll(letters.lastRelaxed)
         for (p in filled) letterCache[p]?.let { st.known[p] = it }
+        GameLog.i("Game", "tahta (okunan harflerle):\n" + board.dump(st.known))
 
         // Raf tamamen okunamadıysa plan yapılamaz. Bir kısmı okunduysa kalan harflerle devam edilir
         // ("Harfleri tanı" butonuna basmak zorunlu değil).
+        if (reading.rack.isEmpty()) GameLog.e("Game", "RAF OKUNAMADI: ${letters.lastRackInfo}")
         if (reading.rack.isEmpty())
             error("Raftaki harfler okunamadı.\n[${letters.lastRackInfo}]")
         val rackUnread = letters.lastUnresolvedRack
+        GameLog.i("Game", "raf: ${reading.rack.joinToString("")} (okunamayan raf karosu=$rackUnread) | tahtada dolu=${filled.size} harfi bilinen=${filled.count { it in st.known }} gevşek okunan=${relaxedCells.size}")
 
         // Skor takibi: önceki analizden bu yana tahtaya eklenenler.
         val scoreMsg = trackScores(board, st, reading.rack)
         if (oppSwapPending > 0) { oppSwapApplied = oppSwapPending; oppSwapPending = 0 }
         else if (turnChanged) oppSwapApplied = 0
+        GameLog.d("Game", "rakip değiştirme: uygulanan=$oppSwapApplied bekleyen=$oppSwapPending turnChanged=$turnChanged")
         st.myScore = myScore
         st.oppScore = oppScore
 
@@ -364,18 +420,23 @@ class GameController(apiKey: String, ctx: Context) {
         for (s in board.slots) {
             // Gevşek eşleşmeyle okunmuş (emin olunmayan) harf içeren yuvalardan öğrenme.
             if (s.cells.all { it in st.known && it !in relaxedCells }) {
-                db.put(db.key(bmp.crop(s.clueRect)), s.cells.map { st.known[it]!! }.joinToString(""))
+                val word = s.cells.map { st.known[it]!! }.joinToString("")
+                val ck = db.key(bmp.crop(s.clueRect))
+                GameLog.d("AutoLearn", "yuva ${slotName(s)} tamamen dolu → kaydedilecek: \"$word\" ipucu=${ClueDb.shortId(ck)}")
+                db.put(ck, word)
             }
         }
 
         // İpucu çözümü: sadece henüz bitmemiş yuvalar.
         val todo = board.slots.filter { st.emptyIn(it) > 0 }.sortedBy { st.emptyIn(it) }
         progress("Raf: ${reading.rack.joinToString("")} — ${todo.size} ipucu kontrol ediliyor")
+        GameLog.i("Game", "çözülecek yuva: ${todo.size}/${board.slots.size} (tamamen dolu: ${board.slots.size - todo.size})")
 
         // TDK sözlüğünü yükle (ilk seferde kısa sürer, sonra anında).
         if (!tdk.ready) {
             progress("TDK sözlüğü yükleniyor…")
             tdk.prepare()
+            GameLog.i("Game", "TDK sözlüğü hazırlandı: ${tdk.ready} ${tdk.loadError}")
         }
 
         // 1. aşama: bellek + telefondaki veritabanı + TDK (kotasız).
@@ -389,12 +450,14 @@ class GameController(apiKey: String, ctx: Context) {
             val local = localCands(s, key, ckey, pattern, crop)
             if (local != null) results[s] = local else pending.add(Pending(s, key, pattern, crop))
         }
+        GameLog.i("Game", "1. aşama (bellek/veritabanı/TDK): çözülen=${results.size} AI'a kalan=${pending.size} TDK ile çözülen=$tdkHits")
         if (tdkHits > 0) progress("TDK ile $tdkHits ipucu çözüldü, ${pending.size} ipucu kaldı")
 
         // 2. aşama: kalanlar (SON ÇARE: AI). Şalter kapalıysa AI'a hiç sorulmaz.
         if (pending.isNotEmpty()) {
             if (!USE_AI) {
                 unsolvedNoAi = pending.size
+                GameLog.w("Game", "AI kapalı: ${pending.size} ipucu çözümsüz bırakıldı: " + pending.joinToString(" ") { slotName(it.slot) })
                 for (p in pending) results[p.slot] = emptyList()
             } else if (deadline - System.currentTimeMillis() < 3000) {
                 lastAiError = "süre doldu"
@@ -420,6 +483,9 @@ class GameController(apiKey: String, ctx: Context) {
             }
         }
         for ((s, c) in results) st.cands[s] = c
+        GameLog.i("Game", "yuva adayları (nihai):\n" + board.slots.joinToString("\n") { s ->
+            "  ${slotName(s)} desen=${s.cells.map { st.known[it] ?: '?' }.joinToString("")} boş=${st.emptyIn(s)} → " + (if (st.emptyIn(s) == 0) "(dolu)" else candsText(st.cands[s]))
+        })
 
         progress("Hamle planlanıyor…")
         // Torba / rakip eli tahmini. Oyunda toplam harf sayısı = boş hücre sayısı.
@@ -442,14 +508,18 @@ class GameController(apiKey: String, ctx: Context) {
             oppHeld = 0; pool = maxOf(0, rest - 6)
         }
         val oppFresh = minOf(6 - oppHeld, pool)                    // rakibin sırası gelince çekeceği yeni harf
+        GameLog.i("Game", "torba/rakip eli tahmini: boşHücre=$emptyCount benimTaş=$myTiles (okunamayan=$rackUnread) kalan(rakipEli+torba)=$rest geçmişBilinir=$histKnown tahminiElde=$heldEst → rakipElinde=$oppHeld torba=$pool rakipYeniÇeker=$oppFresh")
 
         val ctx = if (turns.endgame)
             TurnContext(true, turns.myTurnsLeft.coerceAtLeast(1), turns.oppAfterNextMine,
                 myScore, oppScore, pool, 6, turns.seqFromMyNext, oppHeld)
         else
             TurnContext(false, 99, 1, myScore, oppScore, pool, 6, emptyList(), oppHeld)
+            GameLog.i("Game", "TurnContext: endgame=${ctx.endgame} benimKalanHamle=${ctx.myMovesLeft} sonrasıRakipHamle=${ctx.opponentMovesAfterMe} skor=${ctx.myScore}-${ctx.oppScore} torba=${ctx.poolSize} rakipElinde=${ctx.oppHeld} sıra=${ctx.seq.joinToString("") { if (it) "B" else "R" }}")
 
+        val tPlan = System.currentTimeMillis()
         val plan = Planner(st).plan(reading.rack, ctx)
+        GameLog.i("Game", "PLAN (${System.currentTimeMillis() - tPlan}ms): $plan\nsatırlar:\n" + plan.lines.joinToString("\n"))
         prevPlan = plan
 
         val solved = board.slots.count { st.emptyIn(it) == 0 || !st.cands[it].isNullOrEmpty() }
@@ -493,6 +563,7 @@ class GameController(apiKey: String, ctx: Context) {
                 if (tdkDebug.size > 8) append("\n… +${tdkDebug.size - 8} ipucu daha")
             }
         }
+        GameLog.i("Game", "ANALİZ tamam: ${System.currentTimeMillis() - tAll}ms | çözülen yuva=$solved/${board.slots.size} | ${GameLog.mem()}\nekranda gösterilecek not:\n$note")
         return Analysis(board, reading.rack, plan, note, solved, board.slots.size)
     }
 
@@ -506,11 +577,13 @@ class GameController(apiKey: String, ctx: Context) {
         // 1) Bellek: kayıtlı adaylar, tahtadaki yeni harflere göre elenir.
         candCache[key]?.let { c ->
             val f = c.filter { fits(it.word) }
+            GameLog.d("Clue", "${slotName(s)} desen=$pattern ipucu=${ClueDb.shortId(ckey)}: bellekte ${c.size} aday, desene uyan ${f.size}${if (key in asked) " (AI sorulmuş)" else ""}")
             if (f.isNotEmpty() || key in asked) return f   // AI zaten sorulduysa bir daha sorma
         }
 
         // 2) Telefondaki veritabanı
         val hit = db.get(ckey, s.length).filter { fits(it) }
+        GameLog.d("Clue", "${slotName(s)} desen=$pattern ipucu=${ClueDb.shortId(ckey)}: veritabanı → ${if (hit.isEmpty()) "bulunamadı" else hit.joinToString(",")}")
         if (hit.isNotEmpty()) {
             if (DEBUG_TDK) tdkDebug.add("${s.length}h → kayıtlı veritabanından: ${hit.take(3).joinToString(",")}")
             return hit.map { Candidate(it, 1.0) }.also { candCache[key] = it }
@@ -525,6 +598,7 @@ class GameController(apiKey: String, ctx: Context) {
                 if (text.isEmpty()) ocrEmpty.add(ckey) else ocrCache[ckey] = text
             }
             val t = tdk.candidates(text, s.length, pattern)
+            GameLog.i("Clue", "${slotName(s)} desen=$pattern ipucu=${ClueDb.shortId(ckey)} OCR=\"${text.take(60)}\" → ${if (t == null) "TDK ÇÖZEMEDİ (${tdk.lastReason})" else "TDK çözdü: " + t.take(5).joinToString(",") { it.word }}")
             if (DEBUG_TDK) tdkDebug.add("${s.length}h \"${text.take(40)}\" → ${tdk.lastReason}")
             if (t != null) {
                 tdkHits++
