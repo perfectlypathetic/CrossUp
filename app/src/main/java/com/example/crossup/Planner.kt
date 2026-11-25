@@ -1,6 +1,7 @@
 package com.example.crossup.game
 
 import com.example.crossup.parser.*
+import com.example.crossup.GameLog
 
 /** Boş hücre sayısı bunun altına inince "son 4 tur" başlar. */
 const val ENDGAME_EMPTY_LIMIT = 12
@@ -210,6 +211,32 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
             }
             if (bp >= 0.6) { guess[c] = bl; guessP[c] = bp }
         }
+        logInference()
+    }
+
+    private var lastRiskInfo = ""
+
+    private fun logInference() {
+        try {
+            val sb = StringBuilder()
+            sb.append("PLANNER çıkarım: boş hücre=${empties.size}, bilinen harf=${st.known.size}, kesin tahmin (>=%60)=${guess.size}\n")
+            for (c in empties) {
+                val d = baseDist[c]
+                val txt = if (d == null || d.isEmpty()) "BİLGİ YOK"
+                else d.entries.sortedByDescending { it.value }.take(4).joinToString(" ") { "${it.key}:${(it.value * 100).toInt()}%" }
+                sb.append("  hücre ${cellLabel(c)} → $txt").append(if (guess.containsKey(c)) "  [tahmin ${guess[c]}]" else "").append("\n")
+            }
+            sb.append("yuva budama (aday sayısı: çözücüden → tahtayla budanmış):\n")
+            for (s in st.board.slots) {
+                if (st.emptyIn(s) == 0) continue
+                val raw = st.cands[s]?.size ?: 0
+                val ref = baseRefined[s]?.size ?: 0
+                sb.append("  ${slotLabel(s)} boş=${st.emptyIn(s)} aday=$raw → $ref").append(if (raw > 0 && ref == 0) "  !!! TAHTAYLA ÇELİŞİYOR" else "").append("\n")
+            }
+            GameLog.i("Planner", sb.toString())
+        } catch (ex: Throwable) {
+            GameLog.e("Planner", "çıkarım logu hatası", ex)
+        }
     }
 
     // ------------------------------------------------------------------ yardımcılar
@@ -290,7 +317,7 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
      *  - Torba tamamen rakibe geçecekse (fresh >= pool) rakip kalan her harfi görür: kesin bilgi.
      */
     private fun totalRisk(placed: Set<CellPos>, rackAfter: List<Char>, ctx: TurnContext): Double {
-        if (ctx.opponentMovesAfterMe <= 0) return 0.0
+        if (ctx.opponentMovesAfterMe <= 0) { lastRiskInfo = "rakibin sonraki hamlesi yok → risk 0"; return 0.0 }
         val unseen = unseenCounts(placed, rackAfter)
         var u = empties.size - placed.size - rackAfter.size
         val sumUnseen = unseen.values.sum()
@@ -303,6 +330,7 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
         val total = held + fresh
         val absorbed = fresh >= pool
         val w = if (absorbed) 1.0 else maxOf(cfg.heldMatch, held.toDouble() / u)
+        lastRiskInfo = "u=$u elde=$held torba=$pool yeniÇekilecek=$fresh toplamEl=$total torbaTamamenRakipte=$absorbed w=${GameLog.f(w)} görülmeyen=$unseen"
         var risk = 0.0
         for (slot in st.board.slots) {
             val rem = ArrayList<CellPos>()
@@ -380,9 +408,11 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
 
     fun plan(rack: List<Char>, ctx: TurnContext): Plan {
         val r = rack.map { it.uppercaseChar() }
+        GameLog.i("Planner", "plan() raf=${r.joinToString("")} endgame=${ctx.endgame} sıraUzunluğu=${ctx.seq.size} boşHücre=${empties.size} skor=${ctx.myScore}-${ctx.oppScore} torba=${ctx.poolSize} rakipElinde=${ctx.oppHeld}")
         if (ctx.endgame && ctx.seq.isNotEmpty()) {
             val ep = planEndgame(r, ctx)
             if (ep != null) return ep
+            GameLog.i("Planner", "Son4 kesin hesap sonuç vermedi → sezgisel plana geçiliyor")
         }
         return planHeuristic(r, ctx)
     }
@@ -393,17 +423,25 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
     private fun poolBlocksExact(ctx: TurnContext): Boolean =
         ctx.poolSize > maxOf(0, ctx.oppRackSize - ctx.oppHeld)
 
+    private fun endNull(msg: String): Plan? {
+        GameLog.i("Planner", "SON4 kesin hesap YAPILAMADI: $msg")
+        return null
+    }
+
     private fun planEndgame(rack: List<Char>, ctx: TurnContext): Plan? {
         val e = empties.size
-        if (e == 0 || e > 14 || rack.isEmpty() || !ctx.seq[0]) return null
+        if (e == 0 || e > 14 || rack.isEmpty() || !ctx.seq[0])
+            return endNull("boş hücre=$e (1..14 olmalı), raf boş mu=${rack.isEmpty()}, sıra bende mi=${ctx.seq[0]}")
         // Kesin hesap için torba rakibin sıradaki çekilişinde tamamen boşalmalı (rakip kalan her harfi görür).
-        if (poolBlocksExact(ctx)) return null
+        if (poolBlocksExact(ctx))
+            return endNull("torba boşalmıyor: torba=${ctx.poolSize} > rakibin çekeceği=${maxOf(0, ctx.oppRackSize - ctx.oppHeld)}")
 
         val letterOf = CharArray(e)
         for (i in 0 until e) {
             val c = empties[i]
-            val g = guess[c] ?: return null
-            if ((guessP[c] ?: 0.0) < 0.75) return null
+            val g = guess[c] ?: return endNull("hücre ${cellLabel(c)} harfi belirsiz (tahmin yok)")
+            if ((guessP[c] ?: 0.0) < 0.75)
+                return endNull("hücre ${cellLabel(c)} tahmini %${((guessP[c] ?: 0.0) * 100).toInt()} < %75")
             letterOf[i] = g
         }
         // Rafım, boş hücrelerin harfleriyle tutarlı olmalı (rakibin harfleri = kalanlar).
@@ -411,7 +449,9 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
         for (ch in letterOf) need[ch] = (need[ch] ?: 0) + 1
         val have = HashMap<Char, Int>()
         for (ch in rack) have[ch] = (have[ch] ?: 0) + 1
-        for ((ch, n) in have) if (n > (need[ch] ?: 0)) return null
+        for ((ch, n) in have) if (n > (need[ch] ?: 0)) {
+            return endNull("rafımdaki '$ch' harfi ($n adet) boş hücrelerin harf tahminleriyle tutarsız (beklenen: ${need[ch] ?: 0})")
+        }
 
         val cellIdx = HashMap<CellPos, Int>()
         for (i in 0 until e) cellIdx[empties[i]] = i
@@ -431,7 +471,12 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
             rack, cfg.bonus5, cfg.bonus6
         )
         solver.solveRoot((1 shl e) - 1)
-        val best = solver.bestRoot() ?: return null
+        val best = solver.bestRoot() ?: return endNull("kök hamle bulunamadı")
+        GameLog.i("Planner", "SON4 kesin hesap: boş=$e raf=${rack.joinToString("")} sıra=${ctx.seq.joinToString("") { if (it) "B" else "R" }} kökHamle=${solver.rootMoves.size}\n            hücre harfleri: ${(0 until e).joinToString(" ") { "${cellLabel(empties[it])}=${letterOf[it]}" }}\n" +
+            solver.rootMoves.sortedByDescending { it.value }.take(8).joinToString("\n") { m ->
+                "  değer=${m.value} anlıkPuan=${m.gain} harf=${m.n} hamle=" +
+                    (0 until e).filter { ((m.taken shr it) and 1) == 1 }.joinToString(" ") { i -> "${letterOf[i]}→${cellLabel(empties[i])}" }
+            } + "\n  EN İYİ: değer=${best.value} anlıkPuan=${best.gain} harf=${best.n}")
 
         val diffNow = ctx.myScore - ctx.oppScore
         val finalDiff = diffNow + best.value
@@ -475,7 +520,9 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
         if (placements.isEmpty()) lines.add("  Bu tur PAS en iyisi (rakibi harf oynamaya zorla).")
         for (h in held) lines.add("  ${h.letter}: ${h.reason}")
 
-        return Plan(placements, best.value.toDouble(), placements.isEmpty(), emptyList(), held, emptyList(), lines)
+        val endPlan = Plan(placements, best.value.toDouble(), placements.isEmpty(), emptyList(), held, emptyList(), lines)
+        GameLog.i("Planner", "SON4 planı: $endPlan\n" + lines.joinToString("\n"))
+        return endPlan
     }
 
     // ------------------------------------------------------------------ NORMAL FAZ (ve belirsiz son4)
@@ -505,17 +552,25 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
             left.remove(b.letter)
         }
 
+        GameLog.i("Planner", "açgözlü zincir: " + (if (chosen.isEmpty()) "BOŞ (hiçbir harf için p>0.05 hücre yok)" else chosen.joinToString("  ") { "${it.letter}→${cellLabel(it.cell)} %${(it.p * 100).toInt()}" }))
+        val riskNow = totalRisk(emptySet<CellPos>(), rack, ctx)
+        GameLog.i("Planner", "rakip tamamlama riski şu an=${GameLog.f(riskNow)} riskÇarpanı=${GameLog.f(riskMul(ctx))} | $lastRiskInfo")
         // 2) Zincirin TÜM alt kümelerini değerlendir (bazı harfleri saklamak daha iyi olabilir).
         val k = chosen.size
         var bestSub: List<Placement> = emptyList()
         var bestEv = 0.0
+        val evals = ArrayList<Triple<String, Double, Double>>()
         for (m in 1 until (1 shl k)) {
             val sub = ArrayList<Placement>()
             for (i in 0 until k) if (((m shr i) and 1) == 1) sub.add(chosen[i])
             val ev = evalFull(sub, rack, ctx)
+            evals.add(Triple(sub.joinToString(" ") { "${it.letter}→${cellLabel(it.cell)}" }, ev.total, ev.risk))
             if (ev.total > bestEv) { bestEv = ev.total; bestSub = sub }
         }
 
+        GameLog.i("Planner", "alt küme değerlendirmesi (${evals.size} alt küme; EV = beklenen puan - risk; hiç oynamamak EV=0):\n" +
+            evals.sortedByDescending { it.second }.take(8).joinToString("\n") { "  [${it.first}] EV=${GameLog.f(it.second)} risk=${GameLog.f(it.third)}" } +
+            "\n  SEÇİLEN: EV=${GameLog.f(bestEv)} " + (if (bestSub.isEmpty()) "HİÇBİRİ (pas/değiştir)" else bestSub.joinToString(" ") { "${it.letter}→${cellLabel(it.cell)}" }))
         // 3) Bilgi durumu
         val unknownCells = empties.filter { baseDist[it].isNullOrEmpty() }
         val unknownSlots = st.board.slots.filter { st.emptyIn(it) > 0 && st.cands[it].isNullOrEmpty() }
@@ -523,6 +578,7 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
             st.emptyIn(it) > 0 && !st.cands[it].isNullOrEmpty() && baseRefined[it].isNullOrEmpty()
         }
 
+        GameLog.i("Planner", "bilgi durumu: bilgisiz hücre=${unknownCells.size} [${unknownCells.joinToString(" ") { cellLabel(it) }}] kelimesiz yuva=${unknownSlots.size} [${unknownSlots.joinToString(" ") { slotLabel(it) }}] çelişen yuva=${conflictSlots.size} [${conflictSlots.joinToString(" ") { slotLabel(it) }}]")
         // 4) Her rafta harf için en iyi hücre ihtimali
         val bestP = HashMap<Char, Double>()
         val bestCell = HashMap<Char, CellPos>()
@@ -533,6 +589,8 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
             }
         }
 
+        GameLog.i("Planner", "rafta harf başına en iyi hücre: " + rack.distinct().joinToString("  ") { l -> "$l→${bestCell[l]?.let { c -> cellLabel(c) } ?: "-"} %${((bestP[l] ?: 0.0) * 100).toInt()}" })
+        GameLog.d("Planner", "harf değiştirme kontrolü: endgame=${ctx.endgame} torba=${ctx.poolSize} (>=2 gerekli) bilgisizHücre=${unknownCells.size} (<=${cfg.maxUnknownForSwap} gerekli)")
         // 5) Harf değiştirme: ölü harfler çoksa ve oyun bu turdan az değer veriyorsa.
         var swap: List<Char> = emptyList()
         if (!ctx.endgame && ctx.poolSize >= 2 && unknownCells.size <= cfg.maxUnknownForSwap) {
@@ -544,6 +602,7 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
             }
             if (dead.size >= 2) {
                 val gain = dead.size * freshValue(rack) * 0.7
+                GameLog.i("Planner", "ölü harfler (en iyi ihtimal <%20): ${dead.joinToString("")} | değiştirme kazancı=${GameLog.f(gain)} vs en iyi EV+0.3=${GameLog.f(bestEv + 0.3)} → ${if (gain > bestEv + 0.3) "DEĞİŞTİR" else "değiştirme"}")
                 if (gain > bestEv + 0.3) swap = dead.take(ctx.poolSize)
             }
         }
@@ -592,8 +651,10 @@ class Planner(private val st: GameState, private val cfg: PlannerConfig = Planne
             )
         }
 
-        return Plan(finalPl, if (swap.isNotEmpty()) 0.0 else bestEv, finalPl.isEmpty() && swap.isEmpty(),
+        val hp = Plan(finalPl, if (swap.isNotEmpty()) 0.0 else bestEv, finalPl.isEmpty() && swap.isEmpty(),
             swap, held, unknownCells, lines)
+        GameLog.i("Planner", "SEZGİSEL plan: $hp\n" + lines.joinToString("\n"))
+        return hp
     }
 
     /** Harf neden oynanmadı? Bilgi eksikliği ile stratejiyi ayırır. */
