@@ -30,6 +30,9 @@ import java.util.concurrent.atomic.AtomicInteger
  * Oyun boyunca her şeyi bir dosyaya yazar: buton basışları, ekran yakalama, ızgara okuma,
  * harf tanıma, ipucu çözme, skor takibi, plan hesabı, hatalar, çökmeler.
  *
+ * TEK dosya kullanılır (crossup_log.txt). Uygulama kapanıp açılsa da aynı dosyaya EKLENİR.
+ * Yeni dosya ancak "Eski logları sil" tuşuna basınca açılır.
+ *
  * Dosya iki yere yazılır:
  *  1) Uygulamanın kendi klasörüne (filesDir/logs) - her zaman çalışır.
  *  2) Telefonun İndirilenler/CrossUp klasörüne - dosya yöneticisinden görebilirsin.
@@ -42,10 +45,9 @@ import java.util.concurrent.atomic.AtomicInteger
 object GameLog {
     private const val SUB = "CrossUp"
     private const val DIR = "CrossUp"
-    private const val MAX_BYTES = 40L * 1024 * 1024
-    private const val KEEP_INTERNAL = 10
+    private const val MAX_BYTES = 60L * 1024 * 1024
+    private const val LOG_NAME = "crossup_log.txt"   // tek ve sabit log dosyası
     private const val MAX_SHOTS = 80
-    private const val MIN_USEFUL_BYTES = 2500L
 
     private val exec = Executors.newSingleThreadExecutor { r ->
         Thread(r, "GameLogWriter").apply { isDaemon = true }
@@ -93,13 +95,13 @@ object GameLog {
         return "bellek ${used}MB/${r.maxMemory() / 1048576}MB"
     }
 
-    /** Yeni oturum (yeni dosya) başlatır. forceNew=false ise oturum zaten varsa dokunmaz. */
+    /** Log dosyasını açar (varsa sonuna ekler). Zaten açıksa dokunmaz. forceNew artık kullanılmıyor, uyumluluk için duruyor. */
     fun init(ctx: Context, forceNew: Boolean = false) {
         try {
             val a = ctx.applicationContext
             app = a
             hookCrash()
-            exec.execute { startSession(a, forceNew) }
+            exec.execute { startSession(a) }
         } catch (ex: Throwable) {
         }
     }
@@ -189,28 +191,31 @@ object GameLog {
         }
     }
 
-    /** Eski log dosyalarını ve ekran görüntülerini siler (şu anki oturum kalır). */
+    /** Log dosyasını ve ekran görüntülerini siler, ardından boş yeni bir log dosyası açar. */
     fun clearOld(ctx: Context, onDone: (String) -> Unit) {
         val a = ctx.applicationContext
         try {
             exec.execute {
                 val msg: String = try {
+                    try { internalOut?.close() } catch (ex: Throwable) { }
+                    try { dlOut?.close() } catch (ex: Throwable) { }
+                    internalOut = null; dlOut = null; dlUri = null
+                    ready = false
                     var n = 0
-                    File(a.filesDir, "logs").listFiles()?.forEach {
-                        if (it != internalFile && it.delete()) n++
-                    }
+                    File(a.filesDir, "logs").listFiles()?.forEach { if (it.delete()) n++ }
                     var m = 0
-                    for ((id, nm) in queryOwn(a, null)) {
-                        if (nm == sessionName) continue
-                        if (sessionStamp.isNotEmpty() && nm.contains(sessionStamp)) continue
+                    for ((id, _) in queryOwn(a, null)) {
                         val u = ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id)
-                        if (a.contentResolver.delete(u, null, null) > 0) m++
+                        try { if (a.contentResolver.delete(u, null, null) > 0) m++ } catch (ex: Throwable) { }
                     }
-                    "Eski loglar silindi (uygulama içi: $n, İndirilenler/$DIR: $m dosya)."
+                    shotsSaved = 0
+                    startSession(a)
+                    direct("I", "GameLog", "loglar silindi, yeni log dosyası açıldı")
+                    "Loglar silindi (uygulama içi: $n, İndirilenler/$DIR: $m dosya). Yeni boş log dosyası açıldı."
                 } catch (ex: Throwable) {
+                    try { startSession(a) } catch (x: Throwable) { }
                     "Silme hatası: ${ex.message ?: ex.javaClass.simpleName}"
                 }
-                direct("I", "GameLog", msg)
                 Handler(Looper.getMainLooper()).post { onDone(msg) }
             }
         } catch (ex: Throwable) {
@@ -261,7 +266,7 @@ object GameLog {
         val b = line.toByteArray(Charsets.UTF_8)
         if (bytes + b.size > MAX_BYTES) {
             capped = true
-            raw("!!! LOG SINIRI (40 MB) AŞILDI, yazma durduruldu !!!\n".toByteArray(Charsets.UTF_8))
+            raw("!!! LOG SINIRI (60 MB) AŞILDI, yazma durduruldu. "Eski logları sil" tuşuna bas !!!\n".toByteArray(Charsets.UTF_8))
             return
         }
         bytes += b.size
@@ -274,41 +279,40 @@ object GameLog {
         try { dlOut?.write(b) } catch (ex: Throwable) { }
     }
 
-    private fun startSession(a: Context, forceNew: Boolean) {
+    private fun startSession(a: Context) {
         try {
-            if (ready && !forceNew) return
-            if (ready) {
-                direct("I", "GameLog", "oturum kapatılıyor (yeni oturum başlıyor)")
-                try { internalOut?.close() } catch (ex: Throwable) { }
-                try { dlOut?.close() } catch (ex: Throwable) { }
-                internalOut = null; dlOut = null; dlUri = null
-            }
-            ready = false
-            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-            sessionStamp = stamp
-            sessionName = "crossup_log_v${BuildConfig.BUILD_NUMBER}_$stamp.txt"
+            if (ready) return
+            sessionStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            sessionName = LOG_NAME
             currentName = sessionName
-            bytes = 0L; currentBytes = 0L; capped = false; shotsSaved = 0
+            capped = false; shotsSaved = 0
             dlErr = ""
+            bytes = 0L; currentBytes = 0L
+            var appended = false
 
-            // 1) Uygulama içi kopya
+            // 1) Uygulama içi kopya (varsa sonuna eklenir)
             try {
                 val dir = File(a.filesDir, "logs")
                 dir.mkdirs()
                 val f = File(dir, sessionName)
                 internalFile = f
+                bytes = f.length()
+                appended = bytes > 0
                 internalOut = FileOutputStream(f, true)
-                pruneInternal(dir)
             } catch (ex: Throwable) {
                 internalOut = null
             }
+            currentBytes = bytes
 
-            // 2) İndirilenler/CrossUp kopyası
+            // 2) İndirilenler/CrossUp kopyası (varsa sonuna eklenir)
             try {
-                val u = insertDownload(a, sessionName, "text/plain")
+                val existing = queryOwn(a, sessionName).firstOrNull()
+                val u: Uri? = if (existing != null)
+                    ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, existing.first)
+                else insertDownload(a, sessionName, "text/plain")
                 if (u != null) {
                     dlUri = u
-                    dlOut = a.contentResolver.openOutputStream(u)
+                    dlOut = a.contentResolver.openOutputStream(u, if (existing != null) "wa" else "w")
                     if (dlOut == null) dlErr = "akış açılamadı"
                 } else {
                     dlErr = "MediaStore kayıt vermedi"
@@ -319,7 +323,7 @@ object GameLog {
             }
 
             ready = true
-            append(header(a))
+            append((if (appended) "\n\n" else "") + header(a))
             for (l in pre) append(l)
             pre.clear()
         } catch (ex: Throwable) {
@@ -330,7 +334,8 @@ object GameLog {
         val dm = a.resources.displayMetrics
         val sb = StringBuilder()
         sb.append("==================== CROSSUP LOG ====================\n")
-        sb.append("Oturum      : ").append(sessionName).append("\n")
+        sb.append("Dosya       : ").append(sessionName).append(" (tek dosya, her açılışta sona eklenir)\n")
+        sb.append("Açılış      : ").append(sessionStamp).append("\n")
         sb.append("Sürüm       : v").append(BuildConfig.BUILD_NUMBER).append(" (repo=").append(BuildConfig.GH_REPO).append(")\n")
         sb.append("Cihaz       : ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL)
             .append(" | Android ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n")
@@ -344,14 +349,6 @@ object GameLog {
         sb.append("Not         : Tahta çizimlerinde satır/sütun 1'den başlar, ekranda gösterilen (satır,sütun) ile aynıdır.\n")
         sb.append("=====================================================\n")
         return sb.toString()
-    }
-
-    private fun pruneInternal(dir: File) {
-        try {
-            val files = dir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() } ?: return
-            for (k in KEEP_INTERNAL until files.size) files[k].delete()
-        } catch (ex: Throwable) {
-        }
     }
 
     private fun insertDownload(a: Context, name: String, mime: String): Uri? {
@@ -385,10 +382,14 @@ object GameLog {
     /** Paylaşılacak log dosyasının adresini bulur (yoksa İndirilenler'e kopyalar). Yazıcı iş parçacığında çalışır. */
     private fun pickExport(a: Context): Pair<Uri?, String> {
         val dir = File(a.filesDir, "logs")
-        val files = dir.listFiles()?.filter { it.isFile && it.length() > 0 }
-            ?.sortedByDescending { it.lastModified() } ?: emptyList()
-        val target = files.firstOrNull { it.length() >= MIN_USEFUL_BYTES } ?: files.firstOrNull()
-            ?: return Pair(null, "Paylaşılacak log dosyası yok.")
+        val cur = internalFile
+        val target: File = if (cur != null && cur.exists() && cur.length() > 0) {
+            cur   // her zaman şu anki oturumun dosyası
+        } else {
+            dir.listFiles()?.filter { it.isFile && it.length() > 0 }
+                ?.maxByOrNull { it.lastModified() }
+                ?: return Pair(null, "Paylaşılacak log dosyası yok.")
+        }
         val name = target.name
         val kb = target.length() / 1024
         direct("I", "GameLog", "paylaşım istendi: $name ($kb KB)")
