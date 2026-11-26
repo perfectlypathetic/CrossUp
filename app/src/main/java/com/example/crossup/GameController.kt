@@ -12,6 +12,7 @@ import com.example.crossup.ai.LetterDb
 import com.example.crossup.ai.TdkMatcher
 import com.example.crossup.parser.*
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
 
 /**
  * Kullanıcının kalemle yazdığı NOTLAR (tahmin harfleri). Oyunun kendisine yazılmaz, sadece
@@ -314,7 +315,45 @@ class GameController(apiKey: String, ctx: Context) {
     private fun clueId(ckey: String, length: Int) = "$ckey#$length"
 
     /** Tahtayı okumadan önce night light / ekran filtresini geri alır (filtre yoksa aynen döner). */
-    private fun prep(bmp: Bitmap): Bitmap = bmp.normalizeTint()
+    private fun prep(bmp: Bitmap): Bitmap {
+        lastFilterWarn = detectFilter(bmp)
+        return bmp.normalizeTint()
+    }
+
+    /** Son yakalamada renk filtresi şüphesi varsa uyarı metni (yoksa boş). */
+    @Volatile private var lastFilterWarn = ""
+
+    /**
+     * Ekran renk filtresi (gece ışığı, Twilight, ekstra karartma, göz konforu, okuma modu, renk ters çevirme) tespiti.
+     * Telefona bağlı değil: oyunun KENDİ renklerine bakar. Oyunun beyaz hücresi ve ipucu yeşili
+     * ekranda hiç (veya çok az) bulunmuyorsa renkler değişmiş demektir.
+     */
+    private fun detectFilter(bmp: Bitmap): String {
+        return try {
+            val step = 7
+            var n = 0; var white = 0; var green = 0
+            var y = 0
+            while (y < bmp.height) {
+                var x = 0
+                while (x < bmp.width) {
+                    val p = bmp.getPixel(x, y)
+                    val r = (p shr 16) and 0xFF; val g = (p shr 8) and 0xFF; val b = p and 0xFF
+                    n++
+                    if (abs(r - 254) + abs(g - 254) + abs(b - 254) <= 24) white++
+                    if (abs(r - 0xD7) + abs(g - 0xF1) + abs(b - 0xCA) <= 39) green++
+                    x += step
+                }
+                y += step
+            }
+            val wf = if (n > 0) white.toDouble() / n else 0.0
+            val gf = if (n > 0) green.toDouble() / n else 0.0
+            val bad = wf < 0.01 && gf < 0.005
+            GameLog.i("Filter", "renk kontrolü: beyaz=${GameLog.f(wf * 100)}% yeşil=${GameLog.f(gf * 100)}% → ${if (bad) "FİLTRE ŞÜPHESİ" else "temiz"}")
+            if (bad) "⚠ Ekran renk filtresi açık görünüyor (gece ışığı / Twilight / ekstra karartma / göz konforu / okuma modu / renk ters çevirme). " +
+                "Okuma hataları olabilir; filtreyi kapatıp tekrar dene."
+            else ""
+        } catch (e: Throwable) { "" }
+    }
 
     private fun slotName(s: WordSlot) = "${if (s.dir == Dir.ACROSS) "→" else "↓"}(${s.clueCell.r + 1},${s.clueCell.c + 1})×${s.length}"
 
@@ -323,7 +362,7 @@ class GameController(apiKey: String, ctx: Context) {
         val board = parser.parse(BitmapPixelSource(bmp))
         if (board == null) {
             GameLog.e("Game", "IZGARA BULUNAMADI (ekran ${bmp.width}x${bmp.height}) - oyun ekranı açık mı?")
-            error("Izgara bulunamadı (oyun ekranı açık mı?)")
+            error("Izgara bulunamadı (oyun ekranı açık mı?)" + (if (lastFilterWarn.isNotEmpty()) "\n" + lastFilterWarn else ""))
         }
         GameLog.i("Game", "ızgara ${System.currentTimeMillis() - t0}ms'de okundu: ${board.rows}x${board.cols}, ${board.slots.size} yuva")
         return board
@@ -507,6 +546,7 @@ class GameController(apiKey: String, ctx: Context) {
         GameLog.section("ANALİZ #$runNo (GameController)")
         GameLog.i("Game", "analiz başlıyor | ${scoreLabel()} | tur: ${turns.label} | rakipSonOynadığı=$oppLastPlayed rakipDeğiştirdi(uygulanan)=$oppSwapApplied bekleyen=$oppSwapPending | önbellek: harf=${letterCache.size} aday=${candCache.size} ocr=${ocrCache.size} | ${GameLog.mem()}")
         val bmp = prep(rawBmp)
+        val filterWarn = lastFilterWarn
         progress("Izgara aranıyor…")
         val board = parseBoard(bmp)
         progress("Harfler okunuyor…")
@@ -667,6 +707,7 @@ class GameController(apiKey: String, ctx: Context) {
 
         // Ekranda gösterilecek kısa not: sadece işe yarar şeyler.
         val note = buildString {
+            if (filterWarn.isNotEmpty()) append(filterWarn).append("\n")
             append(scoreLabel())
             if (scoreMsg.isNotEmpty()) append(" ($scoreMsg)")
             append("\nBoş hücre: $emptyCount · torba ≈ $pool")
