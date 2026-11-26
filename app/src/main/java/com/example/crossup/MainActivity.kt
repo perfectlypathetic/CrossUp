@@ -19,7 +19,6 @@ class MainActivity : Activity() {
     private lateinit var keyBox: EditText
     private lateinit var info: TextView
     private lateinit var updInfo: TextView
-    @Volatile private var updating = false
 
     // Güncelleme kontrolü için yardımcı değişkenler
     private var lastCheck = 0L                       // en son ne zaman kontrol edildi
@@ -144,7 +143,8 @@ class MainActivity : Activity() {
     // ---------- Otomatik güncelleme (GitHub Releases) ----------
 
     private fun checkUpdate() {
-        if (updating) return
+        // Güncelleme zaten indiriliyor / kurulum onayı bekliyor: tekrar sorma.
+        if (Updater.busyBuild != 0) { updInfo.text = Updater.status; return }
         val now = System.currentTimeMillis()
         if (now - lastCheck < CHECK_INTERVAL_MS) return
         lastCheck = now
@@ -161,7 +161,7 @@ class MainActivity : Activity() {
                     updInfo.text = "Güncelleme kontrolü başarısız: ${result.exceptionOrNull()?.message}"
                 } else if (rel.isNewer) {
                     updInfo.text = "Yeni sürüm var: ${rel.tag} (şu an: v${BuildConfig.BUILD_NUMBER})"
-                    if (rel.build != declinedBuild) askUpdate(rel)
+                    if (rel.build != declinedBuild && Updater.busyBuild == 0) askUpdate(rel)
                 } else {
                     updInfo.text = "Uygulama güncel (v${BuildConfig.BUILD_NUMBER})"
                 }
@@ -182,6 +182,7 @@ class MainActivity : Activity() {
     }
 
     private fun startUpdate(rel: Updater.Release) {
+        if (Updater.busyBuild != 0) { updInfo.text = Updater.status; return }   // çift başlatma yok
         GameLog.i("Update", "güncelleme başlatıldı: ${rel.tag} (kurulum izni=${packageManager.canRequestPackageInstalls()})")
         if (!packageManager.canRequestPackageInstalls()) {
             pendingRel = rel   // izin verilip geri dönünce güncelleme kendiliğinden devam eder
@@ -189,26 +190,36 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Bu uygulamaya \"bilinmeyen uygulamaları yükle\" iznini ver, sonra uygulamaya geri dön; güncelleme otomatik devam eder", Toast.LENGTH_LONG).show()
             return
         }
-        updating = true
-        Thread {
-            try {
-                val apk = Updater.download(this, rel) { p ->
-                    runOnUiThread { updInfo.text = "İndiriliyor… %$p" }
-                }
-                runOnUiThread { updInfo.text = "Yükleme ekranı açılıyor…" }
-                Updater.install(this, apk)
-            } catch (e: Exception) {
-                GameLog.e("Update", "güncelleme hatası", e)
-                runOnUiThread { updInfo.text = "Güncelleme hatası: ${e.message}" }
-            } finally {
-                updating = false
-            }
-        }.start()
+        // Bildirim izni (Android 13+): indirme ilerlemesi bildirimde görünsün. Reddedilse de güncelleme sürer.
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 200)
+        }
+        // İndirme + kurulum ön plan servisinde yapılır: başka uygulamaya geçsen de devam eder.
+        Updater.begin(rel.build)
+        updInfo.text = Updater.status
+        try {
+            startForegroundService(Intent(this, UpdateService::class.java)
+                .putExtra("url", rel.apkUrl).putExtra("build", rel.build).putExtra("tag", rel.tag))
+        } catch (e: Exception) {
+            GameLog.e("Update", "güncelleme servisi başlatılamadı", e)
+            Updater.finish("Güncelleme başlatılamadı: ${e.message}")
+            updInfo.text = Updater.status
+        }
+    }
+
+    override fun onPause() {
+        Updater.onStatus = null
+        super.onPause()
     }
 
     override fun onResume() {
         super.onResume()
         refreshInfo()
+        Updater.cancelNotif(this, 2); Updater.cancelNotif(this, 3)
+        // Güncelleme arka planda sürüyorsa durumunu canlı göster.
+        Updater.onStatus = { m -> runOnUiThread { if (!isFinishing) updInfo.text = m } }
+        if (Updater.busyBuild != 0) updInfo.text = Updater.status
 
         // İzin için ayarlara gitmiş ve izni vermişse güncellemeye kaldığı yerden devam et,
         // aksi halde yeni sürüm var mı diye otomatik bak.
