@@ -13,6 +13,7 @@ import android.widget.*
 import com.example.crossup.ai.ClueDb
 import com.example.crossup.ai.CloudSync
 import com.example.crossup.ai.LetterDb
+import com.example.crossup.ai.PendingStore
 import com.example.crossup.ai.TdkDb
 import com.example.crossup.service.CaptureService
 
@@ -20,6 +21,7 @@ class MainActivity : Activity() {
     private lateinit var keyBox: EditText
     private lateinit var info: TextView
     private lateinit var updInfo: TextView
+    private lateinit var pendBtn: Button
 
     // Güncelleme kontrolü için yardımcı değişkenler
     private var lastCheck = 0L                       // en son ne zaman kontrol edildi
@@ -52,6 +54,23 @@ class MainActivity : Activity() {
                 showFilterGuide(prefs)
             }
         } }
+
+        // Kelime onayı: yeni kelimeler kaydedilmeden önce sana sorulsun mu?
+        val confirmSwitch = Switch(this).apply {
+            text = "Yeni kelimeleri kaydetmeden önce bana onaylat"
+            setPadding(0, 20, 0, 10)
+            isChecked = PendingStore.confirmEnabled(this@MainActivity)
+            setOnCheckedChangeListener { _, on ->
+                PendingStore.setConfirmEnabled(this@MainActivity, on)
+                Toast.makeText(this@MainActivity,
+                    if (on) "Kelime onayı AÇIK" else "Kelime onayı KAPALI: yeni kelimeler sormadan kaydedilir",
+                    Toast.LENGTH_SHORT).show()
+            }
+        }
+        pendBtn = Button(this).apply {
+            text = "Bekleyen onaylar"
+            setOnClickListener { openReview() }
+        }
 
         info = TextView(this).apply { textSize = 14f; setPadding(0, 40, 0, 10) }
 
@@ -146,6 +165,7 @@ class MainActivity : Activity() {
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40)
                 addView(keyBox); addView(go)
+                addView(confirmSwitch); addView(pendBtn)
                 addView(filterNote); addView(openDisplay); addView(openAccess)
                 addView(info)
                 addView(updInfo)
@@ -154,6 +174,22 @@ class MainActivity : Activity() {
             })
         })
         // Güncelleme kontrolü onResume'da otomatik yapılır (uygulama her açıldığında).
+
+        // Uygulama yeni açıldıysa ve önceki oyundan onay bekleyen bir şey kaldıysa (ör. telefon kapanmıştı) sor.
+        val waiting = PendingStore.get(this).sessionCount()
+        if (s == null && waiting > 0) {
+            AlertDialog.Builder(this)
+                .setTitle("Onay bekleyen bulmaca var")
+                .setMessage("Önceki oyundan $waiting bulmaca için onay bekleyen kelime / çözülmemiş yuva kaldı. " +
+                    "Bulmacanın ekran görüntüsü de saklı. Şimdi bakmak ister misin?")
+                .setPositiveButton("Bak") { _, _ -> openReview() }
+                .setNegativeButton("Sonra", null)
+                .show()
+        }
+    }
+
+    private fun openReview() {
+        startActivity(Intent(this, ReviewActivity::class.java))
     }
 
     // ---------- Ekran filtresi uyarısı ----------
@@ -316,7 +352,11 @@ class MainActivity : Activity() {
             tdkDb.lastError.isNotEmpty() -> "TDK: yüklenemedi (${tdkDb.lastError})"
             else -> "TDK: yükleniyor…"
         }
+        val ps = PendingStore.get(this)
+        pendBtn.text = "Bekleyen onaylar (${ps.sessionCount()} bulmaca)"
+        pendBtn.visibility = if (ps.sessionCount() > 0) android.view.View.VISIBLE else android.view.View.GONE
         info.text = "Kayıtlı kelime: ${ClueDb.get(this).size()}\n" +
+            (if (ps.sessionCount() > 0) "Onay bekleyen: ${ps.sessionCount()} bulmaca, ${ps.itemCount()} yuva\n" else "") +
             "Kayıtlı harf şablonu: ${LetterDb.get(this).size()}\n" +
             tdkLine + "\n" +
             cloud + "\n" +
@@ -351,6 +391,3 @@ class MainActivity : Activity() {
         }
     }
 }
-
-
-
