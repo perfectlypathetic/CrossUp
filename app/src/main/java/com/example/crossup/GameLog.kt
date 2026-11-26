@@ -39,6 +39,9 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * Ekran görüntüleri de (Analiz / Harfleri tanı / Öğren basışlarında) aynı klasöre JPEG olarak kaydedilir.
  *
+ * VARSAYILAN: KAPALI. Ana ekrandaki "Log kaydı" anahtarıyla açılır; kapatana kadar açık kalır
+ * (telefon yeniden başlasa bile hatırlanır). Kapalıyken hiçbir dosya oluşturulmaz, ekran görüntüsü kaydedilmez.
+ *
  * Hiçbir log çağrısı uygulamayı çökertmez; hata olursa sessizce yutulur.
  * Yazma işi ayrı bir iş parçacığında yapıldığı için oyunu yavaşlatmaz.
  */
@@ -75,6 +78,45 @@ object GameLog {
     @Volatile private var crashHooked = false
     private val shotSeq = AtomicInteger(0)
 
+    /** Log kaydı açık mı? Varsayılan KAPALI. Ayar telefonda saklanır. */
+    @Volatile var enabled = false
+        private set
+    private const val PREFS = "crossup_log"
+    private const val KEY_ON = "enabled"
+
+    /** Kayıtlı ayarı okur (uygulama açılırken). */
+    private fun loadSetting(a: Context) {
+        enabled = try { a.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ON, false) } catch (ex: Throwable) { false }
+    }
+
+    fun isEnabled(ctx: Context): Boolean {
+        loadSetting(ctx.applicationContext)
+        return enabled
+    }
+
+    /** Menüdeki anahtar: log kaydını açar/kapatır ve seçimi hatırlar. */
+    fun setEnabled(ctx: Context, on: Boolean) {
+        try {
+            val a = ctx.applicationContext
+            app = a
+            try { a.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ON, on).apply() } catch (ex: Throwable) { }
+            enabled = on
+            if (on) {
+                hookCrash()
+                exec.execute { startSession(a) }
+            } else {
+                exec.execute {
+                    try { internalOut?.flush(); internalOut?.close() } catch (ex: Throwable) { }
+                    try { dlOut?.flush(); dlOut?.close() } catch (ex: Throwable) { }
+                    internalOut = null; dlOut = null; dlUri = null
+                    ready = false
+                    pre.clear()
+                }
+            }
+        } catch (ex: Throwable) {
+        }
+    }
+
     // ------------------------------------------------------------------ genel kullanım
 
     fun d(tag: String, msg: String) = log("D", tag, msg, null)
@@ -100,6 +142,8 @@ object GameLog {
         try {
             val a = ctx.applicationContext
             app = a
+            loadSetting(a)
+            if (!enabled) return          // kapalıyken dosya açılmaz
             hookCrash()
             exec.execute { startSession(a) }
         } catch (ex: Throwable) {
@@ -108,6 +152,7 @@ object GameLog {
 
     /** Ekranda göstermek için kısa durum satırı. */
     fun statusLine(): String {
+        if (!enabled) return "Log kaydı: kapalı"
         if (currentName.isEmpty()) return "Log: henüz başlamadı"
         return "Log: $currentName (${currentBytes / 1024} KB)\nKonum: İndirilenler/$DIR (ekran görüntüleri de orada)"
     }
@@ -124,6 +169,7 @@ object GameLog {
 
     /** Ekran görüntüsünü İndirilenler/CrossUp klasörüne JPEG olarak kaydeder. Dosya adını döner. */
     fun saveShot(bmp: Bitmap, label: String): String {
+        if (!enabled) return ""
         val a = app ?: return ""
         val n = shotSeq.incrementAndGet()
         val safe = label.filter { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '_' }.take(20)
@@ -209,11 +255,14 @@ object GameLog {
                         try { if (a.contentResolver.delete(u, null, null) > 0) m++ } catch (ex: Throwable) { }
                     }
                     shotsSaved = 0
-                    startSession(a)
-                    direct("I", "GameLog", "loglar silindi, yeni log dosyası açıldı")
-                    "Loglar silindi (uygulama içi: $n, İndirilenler/$DIR: $m dosya). Yeni boş log dosyası açıldı."
+                    if (enabled) {
+                        startSession(a)
+                        direct("I", "GameLog", "loglar silindi, yeni log dosyası açıldı")
+                    }
+                    "Loglar silindi (uygulama içi: $n, İndirilenler/$DIR: $m dosya)." +
+                        (if (enabled) " Yeni boş log dosyası açıldı." else "")
                 } catch (ex: Throwable) {
-                    try { startSession(a) } catch (x: Throwable) { }
+                    try { if (enabled) startSession(a) } catch (x: Throwable) { }
                     "Silme hatası: ${ex.message ?: ex.javaClass.simpleName}"
                 }
                 Handler(Looper.getMainLooper()).post { onDone(msg) }
@@ -226,6 +275,7 @@ object GameLog {
     // ------------------------------------------------------------------ iç işler
 
     private fun log(level: String, tag: String, msg: String, t: Throwable?) {
+        if (!enabled) return
         try {
             val ts = System.currentTimeMillis()
             val th = Thread.currentThread().name
@@ -253,7 +303,7 @@ object GameLog {
             val line = fmt.format(Date(ts)) + " " + level + " [" + th + "] " + tag + ": " +
                 text.replace("\n", "\n        ") + "\n"
             if (!ready) {
-                if (pre.size < 3000) pre.add(line)
+                if (enabled && pre.size < 3000) pre.add(line)
                 return
             }
             append(line)
@@ -424,3 +474,6 @@ object GameLog {
         }
     }
 }
+
+
+
