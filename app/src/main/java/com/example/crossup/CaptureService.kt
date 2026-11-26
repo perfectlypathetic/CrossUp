@@ -14,6 +14,8 @@ import android.os.*
 import android.view.*
 import android.widget.*
 import com.example.crossup.ai.CloudSync
+import com.example.crossup.ai.PendingStore
+import com.example.crossup.ReviewActivity
 import com.example.crossup.GameLog
 import com.example.crossup.ai.TR_ALPHABET
 import com.example.crossup.game.Analysis
@@ -53,6 +55,8 @@ class CaptureService : Service() {
     private var kbInfo: TextView? = null
     private lateinit var btnShowNotes: Button
     private lateinit var btnUseNotes: Button
+    private lateinit var btnConfirm: Button
+    private lateinit var btnPending: Button
     private var noteMode = false
     private var noteDir = Dir.ACROSS
     private var noteSel: CellPos? = null
@@ -186,7 +190,9 @@ class CaptureService : Service() {
             }
         }.apply {
             setTextColor(Color.WHITE); textSize = 12f
-            text = "Hazır. 'Analiz'e bas."
+            val waiting = PendingStore.get(applicationContext).sessionCount()
+            text = "Hazır. 'Analiz'e bas." +
+                (if (waiting > 0) "\n📋 Onay bekleyen $waiting bulmaca var ('Bekleyen' tuşuna bas)." else "")
         }
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -200,9 +206,26 @@ class CaptureService : Service() {
         val row2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(btn("Harfleri tanı") { recognize() })
-            addView(btn("Öğren (kaydet)") { learn() })
+            addView(btn("Öğren") { learn() })
             addView(btn("✏ Not") { enterNoteMode() })
         }
+        // Kelime onayı: yeni kelimeler kaydedilmeden önce sana sorulsun mu? + bekleyenleri aç.
+        btnConfirm = btn("Onay") {
+            val on = !PendingStore.confirmEnabled(applicationContext)
+            PendingStore.setConfirmEnabled(applicationContext, on)
+            refreshConfirmUi()
+            status.text = if (on)
+                "Kelime onayı AÇIK: yeni kelimeler önce sana sorulur, sen onaylayınca kaydedilir."
+            else
+                "Kelime onayı KAPALI: yeni kelimeler sormadan doğrudan kaydedilir. (Onay listesinde bekleyen varsa 'Bekleyen' tuşundan bakabilirsin.)"
+        }
+        btnPending = btn("Bekleyen") { openReview() }
+        val rowConfirm = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btnConfirm)
+            addView(btnPending)
+        }
+
         // Not ayarları: notları göster/gizle, analizde kullan/kullanma.
         btnShowNotes = btn("👁 Notlar: görünür") {
             markers.showNotes = !markers.showNotes
@@ -280,10 +303,32 @@ class CaptureService : Service() {
 
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(0xCC000000.toInt()); setPadding(16, 0, 16, 8)
-            addView(handle); addView(scroll); addView(row); addView(row2); addView(rowNotes); addView(rowMe); addView(rowOpp); addView(rowSwap)
+            addView(handle); addView(scroll); addView(row); addView(row2); addView(rowConfirm); addView(rowNotes); addView(rowMe); addView(rowOpp); addView(rowSwap)
         }
         wm.addView(panel, panelLp)
+        refreshConfirmUi()
         GameLog.i("Overlay", "panel eklendi: x=${panelLp.x} y=${panelLp.y} genişlik=${panelLp.width}")
+    }
+
+    /** Onay düğmesinin ve bekleyen sayacının yazısını günceller. */
+    private fun refreshConfirmUi() {
+        val on = PendingStore.confirmEnabled(applicationContext)
+        btnConfirm.text = if (on) "✔ Onay: açık" else "Onay: kapalı"
+        btnPending.text = "📋 Bekleyen (${PendingStore.get(applicationContext).sessionCount()})"
+    }
+
+    /** Onay ekranını açar (bekleyen kelimeler, çözülmemiş yuvalar, bulmaca görüntüsü). */
+    private fun openReview() {
+        if (PendingStore.get(applicationContext).sessionCount() == 0) {
+            status.text = "Onay bekleyen bir şey yok."
+            return
+        }
+        try {
+            startActivity(Intent(this, ReviewActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Throwable) {
+            GameLog.e("Review", "onay ekranı açılamadı", e)
+            status.text = "Onay ekranı açılamadı: ${e.message ?: e.javaClass.simpleName}\nUygulamayı açıp 'Bekleyen onaylar' tuşuna bas."
+        }
     }
 
     /** "Sıradaki ▶": son 4 turda sırayı bir adım ilerletir. */
@@ -382,7 +427,7 @@ class CaptureService : Service() {
                 android.util.Log.e("CrossUp", "analyze", e)
                 GameLog.e("Analyze", "ANALİZ HATASI", e)
                 status.text = "Hata: ${e.message ?: e.javaClass.simpleName}"
-            } finally { busy = false; cloudPush() }
+            } finally { busy = false; cloudPush(); refreshConfirmUi() }
         }
     }
 
@@ -432,17 +477,33 @@ class CaptureService : Service() {
                     }
                 } ?: error("Zaman aşımı.")
                 markers.clear()
-                status.text = "Öğrenme bitti.\n" +
-                    "Dolu yuva: ${r.fullSlots} → yeni kelime: ${r.added}\n" +
-                    (if (r.unreadCells > 0) "Okunamayan hücre: ${r.unreadCells} (tekrar bas)\n" else "") +
-                    "Kayıtlı toplam: ${r.total}"
+                if (r.confirmMode) {
+                    val n = r.queued + r.unsolved
+                    status.text = if (n == 0) {
+                        "Öğren: yeni kelime yok (hepsi zaten kayıtlı).\n" +
+                            (if (r.unreadCells > 0) "Okunamayan hücre: ${r.unreadCells} (tekrar bas)\n" else "") +
+                            "Kayıtlı toplam: ${r.total}"
+                    } else {
+                        "Onay bekleyen: ${r.queued} kelime" +
+                            (if (r.unsolved > 0) ", ${r.unsolved} çözülmemiş yuva" else "") + "\n" +
+                            (if (r.unreadCells > 0) "Okunamayan hücre: ${r.unreadCells} (tekrar bas)\n" else "") +
+                            "Onay ekranı açılıyor…"
+                    }
+                    refreshConfirmUi()
+                    if (n > 0) openReview()
+                } else {
+                    status.text = "Öğrenme bitti.\n" +
+                        "Dolu yuva: ${r.fullSlots} → yeni kelime: ${r.added}\n" +
+                        (if (r.unreadCells > 0) "Okunamayan hücre: ${r.unreadCells} (tekrar bas)\n" else "") +
+                        "Kayıtlı toplam: ${r.total}"
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
                 android.util.Log.e("CrossUp", "learn", e)
                 GameLog.e("Learn", "ÖĞREN HATASI", e)
                 status.text = "Hata: ${e.message ?: e.javaClass.simpleName}"
-            } finally { busy = false; cloudPush() }
+            } finally { busy = false; cloudPush(); refreshConfirmUi() }
         }
     }
 
