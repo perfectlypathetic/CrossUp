@@ -23,6 +23,13 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ReviewActivity"
+            android:exported="false"
+            android:taskAffinity="com.example.crossup.review"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
         <service
             android:name=".service.CaptureService"
             android:exported="false"
@@ -46,6 +53,3 @@
         </receiver>
     </application>
 </manifest>
-
-
-
