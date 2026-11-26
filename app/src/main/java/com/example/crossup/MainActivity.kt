@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Bundle
@@ -45,9 +46,10 @@ class MainActivity : Activity() {
             if (!Settings.canDrawOverlays(this@MainActivity)) {
                 startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
                 Toast.makeText(this@MainActivity, "Üstte gösterme iznini ver, sonra tekrar Başlat", Toast.LENGTH_LONG).show()
+            } else if (prefs.getBoolean("skipFilterGuide", false)) {
+                startCaptureRequest()
             } else {
-                val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                startActivityForResult(mpm.createScreenCaptureIntent(), REQ_PROJECTION)
+                showFilterGuide(prefs)
             }
         } }
 
@@ -86,6 +88,18 @@ class MainActivity : Activity() {
                     }, REQ_CLOUD_PICK
                 )
             }
+        }
+        val filterNote = TextView(this).apply {
+            textSize = 13f; setPadding(0, 20, 0, 6)
+            text = "⚠ Oynamadan önce ekran filtrelerini kapat: gece ışığı, Twilight, ekstra karartma, göz konforu kalkanı, okuma modu, renk ters çevirme. Renkleri değiştirdikleri için harf/hücre okumayı bozar."
+        }
+        val openDisplay = Button(this).apply {
+            text = "Ekran ayarlarını aç"
+            setOnClickListener { openSettings(Settings.ACTION_DISPLAY_SETTINGS) }
+        }
+        val openAccess = Button(this).apply {
+            text = "Erişilebilirlik ayarlarını aç"
+            setOnClickListener { openSettings(Settings.ACTION_ACCESSIBILITY_SETTINGS) }
         }
         val logSwitch = Switch(this).apply {
             text = "Log kaydı (sadece sorun arayan geliştirici için)"
@@ -131,13 +145,57 @@ class MainActivity : Activity() {
         setContentView(ScrollView(this).apply {
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40)
-                addView(keyBox); addView(go); addView(info)
+                addView(keyBox); addView(go)
+                addView(filterNote); addView(openDisplay); addView(openAccess)
+                addView(info)
                 addView(updInfo)
                 addView(cloudNew); addView(cloudPick)
                 addView(logSwitch); addView(logShare); addView(logClear)
             })
         })
         // Güncelleme kontrolü onResume'da otomatik yapılır (uygulama her açıldığında).
+    }
+
+    // ---------- Ekran filtresi uyarısı ----------
+
+    private fun startCaptureRequest() {
+        val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        startActivityForResult(mpm.createScreenCaptureIntent(), REQ_PROJECTION)
+    }
+
+    private fun openSettings(action: String) {
+        try { startActivity(Intent(action)) } catch (e: Exception) {
+            Toast.makeText(this, "Ayar ekranı açılamadı. Elle: Ayarlar'dan ekran / erişilebilirlik bölümüne gir.", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /** Başlat'a basınca: filtreleri kapatma hatırlatması. */
+    private fun showFilterGuide(prefs: SharedPreferences) {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 24, 48, 0) }
+        box.addView(TextView(this).apply {
+            textSize = 14f
+            text = "Renkleri doğru okuyabilmem için şunları KAPAT:\n\n" +
+                "• Gece ışığı / Night Light\n" +
+                "• Twilight (ve benzeri filtre uygulamaları)\n" +
+                "• Ekstra karartma (Extra dim)\n" +
+                "• Göz konforu kalkanı (Samsung)\n" +
+                "• Okuma modu\n" +
+                "• Renk ters çevirme / renk düzeltme\n\n" +
+                "Bunlar renkleri değiştirir; hücreler ve harfler yanlış okunabilir. " +
+                "Android, uygulamaların bu ayarları kapatmasına izin vermez; elle kapatman gerekir."
+        })
+        val never = CheckBox(this).apply { text = "Bir daha gösterme" }
+        box.addView(never)
+        AlertDialog.Builder(this)
+            .setTitle("Başlamadan önce")
+            .setView(box)
+            .setPositiveButton("Devam et") { _, _ ->
+                if (never.isChecked) prefs.edit().putBoolean("skipFilterGuide", true).apply()
+                startCaptureRequest()
+            }
+            .setNeutralButton("Ekran ayarları") { _, _ -> openSettings(Settings.ACTION_DISPLAY_SETTINGS) }
+            .setNegativeButton("İptal", null)
+            .show()
     }
 
     // ---------- Otomatik güncelleme (GitHub Releases) ----------
