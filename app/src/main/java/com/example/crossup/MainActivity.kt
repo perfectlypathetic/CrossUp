@@ -88,6 +88,11 @@ class MainActivity : Activity() {
                 )
             }
         }
+        val logSwitch = Switch(this).apply {
+            text = "Log kaydı (sadece sorun arayan geliştirici için)"
+            setPadding(0, 20, 0, 20)
+            isChecked = GameLog.isEnabled(this@MainActivity)
+        }
         val logShare = Button(this).apply {
             text = "Logu paylaş / gönder"
             setOnClickListener {
@@ -109,13 +114,28 @@ class MainActivity : Activity() {
             }
         }
 
+        // Log düğmeleri sadece log açıkken görünür.
+        fun applyLogUi(on: Boolean) {
+            val v = if (on) android.view.View.VISIBLE else android.view.View.GONE
+            logShare.visibility = v; logClear.visibility = v
+        }
+        applyLogUi(logSwitch.isChecked)
+        logSwitch.setOnCheckedChangeListener { _, on ->
+            GameLog.setEnabled(this@MainActivity, on)
+            applyLogUi(on)
+            refreshInfo()
+            Toast.makeText(this@MainActivity,
+                if (on) "Log kaydı AÇIK (kapatana kadar açık kalır)" else "Log kaydı kapatıldı",
+                Toast.LENGTH_SHORT).show()
+        }
+
         setContentView(ScrollView(this).apply {
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40)
                 addView(keyBox); addView(go); addView(info)
                 addView(updInfo)
                 addView(cloudNew); addView(cloudPick)
-                addView(logShare); addView(logClear)
+                addView(logSwitch); addView(logShare); addView(logClear)
             })
         })
         // Güncelleme kontrolü onResume'da otomatik yapılır (uygulama her açıldığında).
@@ -262,3 +282,6 @@ class MainActivity : Activity() {
         }
     }
 }
+
+
+
