@@ -9,6 +9,8 @@ import com.example.crossup.ai.ClueQuery
 import com.example.crossup.ai.GeminiClueSolver
 import com.example.crossup.ai.LetterReader
 import com.example.crossup.ai.LetterDb
+import com.example.crossup.ai.PendingEntry
+import com.example.crossup.ai.PendingStore
 import com.example.crossup.ai.TdkMatcher
 import com.example.crossup.parser.*
 import java.util.concurrent.ConcurrentHashMap
@@ -92,8 +94,14 @@ class LearnResult(
     val fullSlots: Int,      // tamamen dolu yuva sayısı
     val added: Int,          // veritabanına yeni eklenen kelime sayısı
     val unreadCells: Int,    // harfi okunamayan dolu hücre sayısı
-    val total: Int           // veritabanındaki toplam kelime
+    val total: Int,          // veritabanındaki toplam kelime
+    val confirmMode: Boolean = false,  // true: kelimeler kaydedilmedi, onay listesine gitti
+    val queued: Int = 0,     // onay bekleyen (tahtadan okunan) yeni kelime sayısı
+    val unsolved: Int = 0    // cevabı bilinmeyen (çözülmemiş) yuva sayısı
 )
+
+/** Onay listesine yazılan kayıtların özeti. */
+class PendResult(val words: Int, val unsolved: Int)
 
 /** "Harfleri tanı" butonunun sonucu. */
 class LetterResult(
@@ -131,6 +139,8 @@ class GameController(apiKey: String, ctx: Context) {
     private val letters = LetterReader(ctx)
     private val db = ClueDb.get(ctx)
     private val tdk = TdkMatcher(ctx)
+    private val appCtx: Context = ctx.applicationContext
+    private val pendingStore = PendingStore.get(ctx)
     val turns = TurnTracker()
 
     /** Kullanıcının kalem notları (tahmin harfleri). */
@@ -492,6 +502,57 @@ class GameController(apiKey: String, ctx: Context) {
         return lr
     }
 
+    // ---------- ONAY SİSTEMİ ----------
+    // Ayar açıkken yeni kelimeler doğrudan veritabanına yazılmaz; telefonda kalıcı bir bekleme listesine
+    // (PendingStore) yazılır ve kullanıcı onay ekranında onaylar. Çözülmemiş yuvalar ve bulmacanın
+    // ekran görüntüsü de orada saklanır (telefon kapansa bile kaybolmaz).
+
+    private val knownCache = HashMap<String, List<String>>()
+    private var knownCacheSize = -1
+
+    /** Veritabanındaki kayıtlı cevaplar (aynı ipucu + uzunluk için; veritabanı değişmedikçe önbellekten). */
+    private fun dbWords(ck: String, len: Int): List<String> {
+        val n = db.size()
+        if (n != knownCacheSize) { knownCache.clear(); knownCacheSize = n }
+        return knownCache.getOrPut("$ck#$len") { db.get(ck, len) }
+    }
+
+    /**
+     * Tahtadaki yuvaları tarar:
+     *  - tamamen dolu ve veritabanında OLMAYAN kelime  -> onay bekleyen kelime
+     *  - dolu olmayan ve veritabanında cevabı OLMAYAN yuva -> çözülmemiş yuva (kullanıcı bilirse yazar)
+     * Sonucu kalıcı bekleme listesine yazar, ekran görüntüsünü de saklar.
+     */
+    private fun recordPending(bmp: Bitmap, board: ParsedBoard, known: Map<CellPos, Char>): PendResult {
+        val entries = ArrayList<PendingEntry>()
+        var words = 0
+        var unsolved = 0
+        for (s in board.slots) {
+            val clue = bmp.crop(s.clueRect)
+            val ck = db.key(clue)
+            if (ck == "BLANK" || ck.length < 258 || ck[256] != '@') continue   // ipucu görüntüsü okunamadı: kaydedilemez
+            val chars: List<Char?> = s.cells.map { c -> if (c in known && c !in relaxedCells) known[c] else null }
+            val complete = chars.all { it != null }
+            val word = if (complete) chars.joinToString("") else ""
+            val pattern = chars.joinToString("") { (it ?: '_').toString() }
+            val saved = dbWords(ck, s.length)
+            if (complete) {
+                if (saved.any { it.equals(word, ignoreCase = true) }) continue   // zaten kayıtlı
+                words++
+            } else {
+                if (saved.isNotEmpty()) continue                                  // cevabı zaten kayıtlı: sorma
+                unsolved++
+            }
+            entries.add(PendingEntry(
+                slotKey(s), ck, s.length, pattern, word, clue,
+                if (s.dir == Dir.ACROSS) "→" else "↓", s.clueCell.r + 1, s.clueCell.c + 1
+            ))
+        }
+        pendingStore.record(board.slots.map { slotKey(it) }, entries, bmp)
+        GameLog.i("Pending", "onay listesi: yeni kelime=$words çözülmemiş yuva=$unsolved (kayıt sayısı=${entries.size})")
+        return PendResult(words, unsolved)
+    }
+
     /**
      * ÖĞREN: Analiz yapmaz, plan çıkarmaz, ipucu çözdürmez, rafı okumaz.
      * Sadece tahtadaki harfleri okur ve tamamen dolu yuvaları veritabanına kaydeder.
@@ -515,6 +576,15 @@ class GameController(apiKey: String, ctx: Context) {
         val known = HashMap<CellPos, Char>()
         for (p in filled) letterCache[p]?.let { known[p] = it }
         GameLog.i("Learn", "tahta (okunan harflerle):\n" + board.dump(known))
+
+        if (PendingStore.confirmEnabled(appCtx)) {
+            progress("Onay listesi hazırlanıyor…")
+            val pr = recordPending(bmp, board, known)
+            val fullSlots = board.slots.count { s -> s.cells.all { it in known } }
+            val unreadCells = filled.count { it !in known }
+            GameLog.i("Learn", "ÖĞREN (onay modu): dolu yuva=$fullSlots onay bekleyen=${pr.words} çözülmemiş=${pr.unsolved} okunamayan hücre=$unreadCells")
+            return LearnResult(fullSlots, 0, unreadCells, db.size(), true, pr.words, pr.unsolved)
+        }
 
         progress("Veritabanına kaydediliyor…")
         val before = db.size()
@@ -596,14 +666,20 @@ class GameController(apiKey: String, ctx: Context) {
 
         val deadline = System.currentTimeMillis() + AI_TIME_LIMIT_MS
 
-        // ÖĞRENME: tamamen dolmuş yuvaların ipucu görüntüsünü ve cevabını telefona kaydet.
-        for (s in board.slots) {
-            // Gevşek eşleşmeyle okunmuş (emin olunmayan) harf içeren yuvalardan öğrenme.
-            if (s.cells.all { it in st.known && it !in relaxedCells }) {
-                val word = s.cells.map { st.known[it]!! }.joinToString("")
-                val ck = db.key(bmp.crop(s.clueRect))
-                GameLog.d("AutoLearn", "yuva ${slotName(s)} tamamen dolu → kaydedilecek: \"$word\" ipucu=${ClueDb.shortId(ck)}")
-                db.put(ck, word)
+        // ÖĞRENME: tamamen dolmuş yuvaların ipucu görüntüsünü ve cevabını kaydet.
+        if (PendingStore.confirmEnabled(appCtx)) {
+            // Onay açık: doğrudan veritabanına yazma; kalıcı onay listesine yaz (kullanıcı onaylayınca kaydedilir).
+            runCatching { recordPending(bmp, board, st.known) }
+                .onFailure { GameLog.e("Pending", "onay listesi yazılamadı (analiz sürüyor)", it) }
+        } else {
+            for (s in board.slots) {
+                // Gevşek eşleşmeyle okunmuş (emin olunmayan) harf içeren yuvalardan öğrenme.
+                if (s.cells.all { it in st.known && it !in relaxedCells }) {
+                    val word = s.cells.map { st.known[it]!! }.joinToString("")
+                    val ck = db.key(bmp.crop(s.clueRect))
+                    GameLog.d("AutoLearn", "yuva ${slotName(s)} tamamen dolu → kaydedilecek: \"$word\" ipucu=${ClueDb.shortId(ck)}")
+                    db.put(ck, word)
+                }
             }
         }
 
@@ -796,6 +872,3 @@ class GameController(apiKey: String, ctx: Context) {
         return null
     }
 }
-
-
-
