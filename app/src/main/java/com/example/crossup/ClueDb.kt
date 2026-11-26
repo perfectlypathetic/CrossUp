@@ -9,6 +9,8 @@ import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.roundToInt
 
 /**
@@ -24,6 +26,13 @@ import kotlin.math.roundToInt
  * (tek harflilerde S,D,M gibi). Yeni parmak izi sadece YAZININ/RESMİN kapladığı kutuyu alır
  * (yazının hücre içindeki yeri önemsizleşir) ve en/boy oranını da içerir.
  * Eski (v2) kayıtlar bilerek yüklenmez; dosyası silinmeden "clues.v2-eski.json" adıyla saklanır.
+ *
+ * YENİ (v3 + "#" eki): Ölçüm gösterdi ki 256 bitlik parmak izi, kırpma 1-2 piksel kaysa bile
+ * (tek bir sapma piksel mürekkep kutusunu değiştirir, bütün bitler kayar) aynı resmi farklı resimden
+ * ayıramıyordu. Bu yüzden anahtarın sonuna "#<400 hane>" eklenir: 20x20 yumuşak (bulanık) mürekkep haritası.
+ * Uç noktalar kırpılarak (yüzde 2-98) hesaplanır, karşılaştırırken ±2 hücre kaydırma payı vardır.
+ * Eski kayıtlar (eki olmayan) bozulmaz; eski yöntemle eşleşmeye devam eder ve aynı ipucu tekrar öğrenilince
+ * yeni parmak iziyle yükseltilir.
  */
 class ClueDb private constructor(ctx: Context) {
     private val dir = ctx.filesDir
@@ -43,14 +52,33 @@ class ClueDb private constructor(ctx: Context) {
         private const val BLANK = "BLANK"
         private const val TAG = "ClueDb"
 
-        /** Bu farka kadar (256 bit + en/boy cezası) aynı ipucu sayılır. Ölçüm: aynı ipucu en çok ~16-22, farklı ipuçları en az ~26-30. */
-        const val MAX_DIST = 21
-        /** 1-2 harflik cevaplarda hata çok pahalı: daha sıkı. Kaçırırsa TDK/OCR devreye girer. */
-        const val MAX_DIST_SHORT = 18
-        /** Kayıt sırasında bu kadar yakın anahtar "aynı ipucu" sayılıp birleştirilir (daha uzaksa ayrı kayıt açılır). */
-        const val MERGE_DIST = 10
-        /** En yakın iki farklı kayıt arasında en az bu fark olmalı, yoksa (ve cevapları farklıysa) belirsizdir. */
-        const val AMBIGUOUS_GAP = 6
+        /**
+         * Bu farka kadar (256 bit + en/boy cezası) aynı ipucu sayılır.
+         * ÖLÇÜM (bulut dosyasındaki 212 kayıt): aynı resmin iki görünümü arasındaki fark 11-24 (ALA 19, N 23, SAÇ 24...),
+         * farklı ipuçları arasındaki en küçük fark 31. Eski sınırlar (21 ve 18) aynı resmi kaçırıyordu; bu yüzden
+         * resim her çıktığında yeniden "bilinmiyor" oluyordu.
+         */
+        const val MAX_DIST = 27
+        /** 1-2 harflik cevaplarda hata çok pahalı: biraz daha sıkı, ama ölçülen en büyük aynı-resim farkının (N=23) üstünde. */
+        const val MAX_DIST_SHORT = 26
+        /** Yeni parmak izi ızgarası (DG x DG) ve uzunluğu. */
+        private const val DG = 20
+        private const val DLEN = DG * DG
+        private const val SHIFT = 2
+        private const val BIGD = 1e9
+
+        /**
+         * Yeni parmak izi mesafesi (0 = aynı, 1 = tamamen farklı) bu sınıra kadar aynı ipucu sayılır.
+         * ÖLÇÜM (örnek ekran, 22 ipucu, 1-2 piksel kayma/boyut değişimi + gece ışığı/karartma):
+         * aynı resim en çok 0.155, farklı ipuçları en az 0.229. Sınır ikisinin arasında.
+         */
+        const val DESC_LIMIT = 0.19
+        /** 1-2 harflik cevaplarda daha sıkı. */
+        const val DESC_LIMIT_SHORT = 0.17
+        /** Kayıt sırasında sınırın bu kadarı içindeki anahtar "aynı ipucu" sayılıp birleştirilir. */
+        const val MERGE_RATIO = 0.37
+        /** En yakın iki farklı kayıt arasında oran farkı en az bu kadar olmalı, yoksa (ve cevapları farklıysa) belirsizdir. */
+        const val AMBIGUOUS_RATIO = 0.2
 
         @Volatile private var inst: ClueDb? = null
         fun get(ctx: Context): ClueDb =
@@ -60,9 +88,23 @@ class ClueDb private constructor(ctx: Context) {
 
         private fun isValid(k: String) = k.length > BITS + 1 && k[BITS] == '@'
 
+        /** Anahtarın en/boy sayısı ("@" ile "#" arası). */
+        private fun aspectOf(k: String): Int? {
+            val e = k.indexOf('#').let { if (it < 0) k.length else it }
+            return k.substring(BITS + 1, e).toIntOrNull()
+        }
+
+        /** Yeni parmak izi (400 hane); eski biçimli anahtarlarda yok. */
+        private fun descOf(k: String): String? {
+            val i = k.indexOf('#')
+            return if (i >= 0 && k.length - i - 1 == DLEN) k.substring(i + 1) else null
+        }
+
+        private fun decode(d: String) = IntArray(DLEN) { (d[it] - '0').coerceIn(0, 9) }
+
         /** Log için kısa ipucu kimliği: parmak izinin özeti + en/boy. */
         fun shortId(k: String): String =
-            if (!isValid(k)) k else Integer.toHexString(k.hashCode()) + "@" + k.substring(BITS + 1)
+            if (!isValid(k)) k else Integer.toHexString(k.hashCode()) + "@" + (aspectOf(k) ?: 0)
     }
 
     init {
@@ -195,27 +237,180 @@ class ClueDb private constructor(ctx: Context) {
         val mean = cov.average()
         val bits = String(CharArray(BITS) { if (cov[it] > mean) '1' else '0' })
         val aspect = ((bw.toDouble() / bh) * 100).roundToInt().coerceIn(1, 9999)
-        return "$bits@$aspect"
+        val oldKey = "$bits@$aspect"
+        val desc = descriptor(px, w, x0, y0, iw, ih, br, bg, bb)
+        return if (desc != null) "$oldKey#$desc" else oldKey
     }
 
-    private fun dist(a: String, b: String): Int {
+    /** Histogramdan yüzdelik (numpy "linear" ile aynı). */
+    private fun percentile(hist: IntArray, n: Int, q: Double): Double {
+        val p = q * (n - 1)
+        val lo = p.toInt()
+        val frac = p - lo
+        fun at(r: Int): Int {
+            var c = 0
+            for (i in hist.indices) { c += hist[i]; if (c > r) return i }
+            return hist.size - 1
+        }
+        val a = at(lo)
+        val b = at(minOf(lo + 1, n - 1))
+        return a + (b - a) * frac
+    }
+
+    /**
+     * YENİ PARMAK İZİ: kaymaya/boyuta dayanıklı 20x20 yumuşak mürekkep haritası ("0".."9" ile 400 hane).
+     * 1) Arka plandan farkı (brightness'a göre ölçeklenmiş) "mürekkep yoğunluğu" yapılır.
+     * 2) Yoğun piksellerin kutusu yüzde 2-98 ile kırpılarak bulunur (tek tük aykırı piksel kutuyu bozamaz).
+     * 3) Kutu 20x20'ye alan ortalamasıyla küçültülür, hafifçe bulanıklaştırılır.
+     */
+    private fun descriptor(px: IntArray, w: Int, x0: Int, y0: Int, iw: Int, ih: Int, br: Int, bg: Int, bb: Int): String? {
+        val n = iw * ih
+        val d = IntArray(n)
+        val hist = IntArray(766)
+        for (y in 0 until ih) for (x in 0 until iw) {
+            val p = px[(y + y0) * w + (x + x0)]
+            val v = abs(((p shr 16) and 0xFF) - br) + abs(((p shr 8) and 0xFF) - bg) + abs((p and 0xFF) - bb)
+            d[y * iw + x] = v
+            hist[v]++
+        }
+        val scale = maxOf(percentile(hist, n, 0.97), 60.0)
+        val soft = FloatArray(n) { minOf(d[it] / scale, 1.0).toFloat() }
+
+        val xh = IntArray(iw)
+        val yh = IntArray(ih)
+        var cnt = 0
+        for (y in 0 until ih) for (x in 0 until iw) {
+            if (soft[y * iw + x] > 0.35f) { xh[x]++; yh[y]++; cnt++ }
+        }
+        if (cnt < 20) return null
+        val bx0 = percentile(xh, cnt, 0.02).toInt()
+        val bx1 = minOf(percentile(xh, cnt, 0.98).toInt() + 1, iw)
+        val by0 = percentile(yh, cnt, 0.02).toInt()
+        val by1 = minOf(percentile(yh, cnt, 0.98).toInt() + 1, ih)
+        val sw = bx1 - bx0
+        val sh = by1 - by0
+        if (sw < 2 || sh < 2) return null
+
+        // Alan ortalamasıyla DG x DG'ye küçült (kesirli piksel ağırlıklarıyla).
+        val out = DoubleArray(DLEN)
+        for (j in 0 until DG) {
+            val ys = by0 + j * sh.toDouble() / DG
+            val ye = by0 + (j + 1) * sh.toDouble() / DG
+            for (i in 0 until DG) {
+                val xs = bx0 + i * sw.toDouble() / DG
+                val xe = bx0 + (i + 1) * sw.toDouble() / DG
+                var tot = 0.0
+                var ws = 0.0
+                for (yy in floor(ys).toInt() until ceil(ye).toInt()) {
+                    if (yy >= ih) continue
+                    val wy = minOf(yy + 1.0, ye) - maxOf(yy.toDouble(), ys)
+                    if (wy <= 0.0) continue
+                    for (xx in floor(xs).toInt() until ceil(xe).toInt()) {
+                        if (xx >= iw) continue
+                        val wx = minOf(xx + 1.0, xe) - maxOf(xx.toDouble(), xs)
+                        if (wx <= 0.0) continue
+                        tot += soft[yy * iw + xx] * wy * wx
+                        ws += wy * wx
+                    }
+                }
+                out[j * DG + i] = if (ws > 0.0) tot / ws else 0.0
+            }
+        }
+
+        // Hafif bulanıklık (yatay sonra dikey), kenarlar uzatılır.
+        fun at(src: DoubleArray, yy: Int, xx: Int) = src[yy.coerceIn(0, DG - 1) * DG + xx.coerceIn(0, DG - 1)]
+        val k0 = 0.239
+        val k1 = 0.522
+        val hz = DoubleArray(DLEN)
+        for (y in 0 until DG) for (x in 0 until DG) {
+            hz[y * DG + x] = k0 * at(out, y, x - 1) + k1 * at(out, y, x) + k0 * at(out, y, x + 1)
+        }
+        val bl = DoubleArray(DLEN)
+        for (y in 0 until DG) for (x in 0 until DG) {
+            bl[y * DG + x] = k0 * at(hz, y - 1, x) + k1 * at(hz, y, x) + k0 * at(hz, y + 1, x)
+        }
+        val sb = StringBuilder(DLEN)
+        for (v in bl) sb.append('0' + floor(v * 9 + 0.5).toInt().coerceIn(0, 9))
+        return sb.toString()
+    }
+
+    /** Eski yöntem (256 bit + en/boy cezası). */
+    private fun oldDist(a: String, b: String): Int {
         if (!isValid(a) || !isValid(b)) return BIG
         var d = 0
         for (i in 0 until BITS) if (a[i] != b[i]) d++
-        val aa = a.substring(BITS + 1).toIntOrNull() ?: return BIG
-        val bb = b.substring(BITS + 1).toIntOrNull() ?: return BIG
+        val aa = aspectOf(a) ?: return BIG
+        val bb = aspectOf(b) ?: return BIG
         return d + abs(aa - bb) / 5
     }
 
-    /** Anahtara en yakın kayıt (kelime uzunluğuna BAKMADAN); maxDist'ten uzaksa null. */
-    private fun nearestKey(key: String, maxDist: Int): String? {
-        var best: String? = null
-        var bestD = BIG
-        for (k in map.keys) {
-            val d = dist(k, key)
-            if (d < bestD) { bestD = d; best = k }
+    /** Yeni yöntem: 20x20 haritalar, ±SHIFT hücre kaydırma payı, içeriğe göre normalleştirilmiş fark (0..1). */
+    private fun descDist(a: IntArray, b: IntArray): Double {
+        var best = Double.MAX_VALUE
+        for (dy in -SHIFT..SHIFT) for (dx in -SHIFT..SHIFT) {
+            var sa = 0
+            var sm = 0
+            val ys = maxOf(0, dy); val ye = DG + minOf(0, dy)
+            val xs = maxOf(0, dx); val xe = DG + minOf(0, dx)
+            for (y in ys until ye) {
+                val ra = y * DG
+                val rb = (y - dy) * DG
+                for (x in xs until xe) {
+                    val p = a[ra + x]
+                    val q = b[rb + x - dx]
+                    sa += abs(p - q)
+                    sm += maxOf(p, q)
+                }
+            }
+            val v = if (sm == 0) 1.0 else sa.toDouble() / sm
+            if (v < best) best = v
         }
-        return if (best != null && bestD <= maxDist) best else null
+        return best
+    }
+
+    /** Kayıtların çözülmüş yeni parmak izleri (yoksa boş dizi). Sadece kayıt anahtarları için önbelleğe alınır. */
+    private val recCache = HashMap<String, IntArray>()
+    private fun recDecoded(k: String): IntArray =
+        recCache.getOrPut(k) { descOf(k)?.let { decode(it) } ?: IntArray(0) }
+
+    /**
+     * Eşleşme ORANI: 1.0 = tam sınırda, küçük = daha benzer. İki tarafta da yeni parmak izi varsa o,
+     * yoksa eski yöntem kullanılır (her biri kendi sınırına bölünür).
+     */
+    private fun score(qKey: String, qd: IntArray?, k: String, short: Boolean): Double {
+        val rd = recDecoded(k)
+        if (qd != null && rd.isNotEmpty()) {
+            return descDist(qd, rd) / (if (short) DESC_LIMIT_SHORT else DESC_LIMIT)
+        }
+        val d = oldDist(qKey, k)
+        if (d >= BIG) return BIGD
+        return d.toDouble() / (if (short) MAX_DIST_SHORT else MAX_DIST)
+    }
+
+    /** Anahtara en yakın kayıt (kelime uzunluğuna BAKMADAN); oran maxRatio'dan büyükse null. */
+    private fun nearestKey(key: String, maxRatio: Double): String? {
+        val qd = descOf(key)?.let { decode(it) }
+        var best: String? = null
+        var bs = BIGD
+        for (k in map.keys) {
+            if (k == key) return k
+            val s = score(key, qd, k, false)
+            if (s < bs) { bs = s; best = k }
+        }
+        return if (best != null && bs <= maxRatio) best else null
+    }
+
+    /**
+     * Eski biçimli (yeni parmak izi olmayan) kaydı, aynı ipucunun yeni parmak iziyle yükseltir.
+     * Yeni anahtarı döner (yükseltme yoksa aynı anahtar).
+     */
+    private fun upgrade(target: String, incoming: String): String {
+        if (target == incoming || descOf(incoming) == null || descOf(target) != null) return target
+        if (map.containsKey(incoming)) return target
+        val set = map.remove(target) ?: return target
+        recCache.remove(target)
+        map[incoming] = set
+        return incoming
     }
 
     /**
@@ -229,50 +424,57 @@ class ClueDb private constructor(ctx: Context) {
             GameLog.d(TAG, "get: anahtar geçersiz/BLANK (uzunluk=$length) → boş")
             return emptyList()
         }
-        var best: String? = null; var bd = BIG
-        var second: String? = null; var sd = BIG
+        val short = length <= 2
+        val qd = descOf(key)?.let { decode(it) }
+        var best: String? = null; var bs = BIGD
+        var second: String? = null; var ss = BIGD
         for (k in map.keys) {
-            val d = dist(k, key)
-            if (d < bd) { second = best; sd = bd; best = k; bd = d }
-            else if (d < sd) { second = k; sd = d }
+            val sc = score(key, qd, k, short)
+            if (sc < bs) { second = best; ss = bs; best = k; bs = sc }
+            else if (sc < ss) { second = k; ss = sc }
         }
-        val limit = if (length <= 2) MAX_DIST_SHORT else MAX_DIST
         val id = shortId(key)
+        val how = if (qd != null) "yeni" else "eski"
         val b = best
         if (b == null) {
             GameLog.d(TAG, "get $id uzunluk=$length: veritabanı boş → boş")
             return emptyList()
         }
-        if (bd > limit) {
-            GameLog.d(TAG, "get $id uzunluk=$length: en yakın kayıt ${shortId(b)} mesafe=$bd > sınır=$limit → bulunamadı")
+        if (bs > 1.0) {
+            GameLog.d(TAG, "get $id uzunluk=$length: en yakın kayıt ${shortId(b)} oran=${GameLog.f(bs)} > 1 (sınır) [$how] → bulunamadı")
             return emptyList()
         }
         val words = map[b]!!.filter { it.length == length }
         if (words.isEmpty()) {
-            GameLog.d(TAG, "get $id uzunluk=$length: en yakın ${shortId(b)} mesafe=$bd ama bu uzunlukta cevabı yok (kayıtlı: ${map[b]!!.joinToString(",")}) → boş")
+            GameLog.d(TAG, "get $id uzunluk=$length: en yakın ${shortId(b)} oran=${GameLog.f(bs)} ama bu uzunlukta cevabı yok (kayıtlı: ${map[b]!!.joinToString(",")}) → boş")
             return emptyList()
         }
         val s = second
-        if (s != null && sd <= limit && sd - bd < AMBIGUOUS_GAP) {
+        if (s != null && ss <= 1.0 && ss - bs < AMBIGUOUS_RATIO) {
             val other = map[s]!!.filter { it.length == length }
             if (other.isNotEmpty() && other.toSet() != words.toSet()) {
-                GameLog.w(TAG, "get $id uzunluk=$length: BELİRSİZ en yakın ${shortId(b)}=$bd (${words.joinToString(",")}) ikinci ${shortId(s)}=$sd (${other.joinToString(",")}) → boş")
+                GameLog.w(TAG, "get $id uzunluk=$length: BELİRSİZ en yakın ${shortId(b)}=${GameLog.f(bs)} (${words.joinToString(",")}) ikinci ${shortId(s)}=${GameLog.f(ss)} (${other.joinToString(",")}) → boş")
                 return emptyList()
             }
         }
-        GameLog.d(TAG, "get $id uzunluk=$length: BULUNDU ${shortId(b)} mesafe=$bd ikinci=${if (s == null) "yok" else sd.toString()} → ${words.joinToString(",")}")
+        GameLog.d(TAG, "get $id uzunluk=$length: BULUNDU ${shortId(b)} oran=${GameLog.f(bs)} [$how] ikinci=${if (s == null) "yok" else GameLog.f(ss)} → ${words.joinToString(",")}")
         return words
     }
 
     @Synchronized
     fun put(key: String, word: String) {
         if (!isValid(key) || word.isEmpty()) return
-        val near = nearestKey(key, MERGE_DIST)
-        val k = near ?: key
+        val near = nearestKey(key, MERGE_RATIO)
+        var k = near ?: key
+        var upgraded = false
+        if (near != null) {
+            val up = upgrade(near, key)
+            if (up != near) { k = up; upgraded = true }
+        }
         val added = map.getOrPut(k) { HashSet() }.add(word)
-        if (added) {
+        if (added || upgraded) {
             save()
-            GameLog.d(TAG, "put ${shortId(key)} → \"$word\": ${if (near == null) "YENİ ipucu kaydı" else "mevcut kayıt ${shortId(near)} ile birleşti"}, kelime EKLENDİ (toplam kelime=${map.values.sumOf { it.size }})")
+            GameLog.d(TAG, "put ${shortId(key)} → \"$word\": ${if (near == null) "YENİ ipucu kaydı" else "mevcut kayıt ${shortId(near)} ile birleşti${if (upgraded) " (yeni parmak iziyle yükseltildi)" else ""}"}, ${if (added) "kelime EKLENDİ" else "kelime zaten vardı"} (toplam kelime=${map.values.sumOf { it.size }})")
         }
     }
 
@@ -289,12 +491,18 @@ class ClueDb private constructor(ctx: Context) {
     fun mergeJson(o: JSONObject): Int {
         val imported = parseObj(o)
         var added = 0
+        var changed = false
         for ((k, words) in imported) {
-            val target = nearestKey(k, MERGE_DIST) ?: k
+            val near = nearestKey(k, MERGE_RATIO)
+            var target = near ?: k
+            if (near != null) {
+                val up = upgrade(near, k)
+                if (up != near) { target = up; changed = true }
+            }
             val set = map.getOrPut(target) { HashSet() }
             for (w in words) if (set.add(w)) added++
         }
-        if (added > 0) save()
+        if (added > 0 || changed) save()
         GameLog.i(TAG, "buluttan birleştirme: +$added kelime (toplam ${map.values.sumOf { it.size }}, atlanan eski kayıt=$lastSkipped)")
         return added
     }
